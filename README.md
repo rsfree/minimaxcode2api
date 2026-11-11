@@ -191,7 +191,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 
 | 路由 | 说明 | 状态 |
 |---|---|---|
-| `POST /v1/images/generations` | OpenAI 图片接口，支持 `n` / `size` / `quality` / `response_format=url\|b64_json` / 参考图 `image` | ✅ 真调通过 |
+| `POST /v1/images/generations` | OpenAI 图像协议（canonical），见下节 | ✅ 真调 + schema 全验 |
+| `POST /v1/images/edits` | multipart 前门，折叠成同一份 canonical | ✅ 端到端验过 |
 | 视频四个端点 | 异步视频协议（canonical），见下节 | ✅ 提交/查询/列表/删除全验 |
 | `POST /v1/audio/speech` | 文本转语音，直接回音频字节 | ✅ 真调通过 |
 | `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
@@ -201,7 +202,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 ### 上游的五个坑（都是实测踩出来的）
 
 1. **业务错误永远 HTTP 200**，真正的码在 body 的 `code` 里：`0` 成功、`400` 参数、
-   `402` 计费、`401` 凭据。只看状态码会把"余额不足"当成成功。
+   `402` 计费、`401` 凭据。只看状态码会把"限额触顶"当成成功。
 2. **`code=503` 不是失败，是"稍后再查"**。视频会返回
    `status=succeeded` + `code=503` + "已就绪但还没准备好下发，查同一个 task_id，
    别重新提交"。网关此时对外报 `status=running` 并带上 `upstream_status`，
@@ -220,12 +221,23 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 
 | 能力 | 结果 |
 |---|---|
-| 图片生成 / TTS / ASR / 音乐 | 正常出结果（成本低，走套餐额度） |
+| 图片生成 / TTS / ASR / 音乐 | 正常出结果（成本低，走各自的额度池） |
 | `MiniMax-Hailuo-2.3` 视频 | 提交需 **280 credits**，额度不足时 `402` |
 | `MiniMax-H3` 视频 | 提交需 **416 credits**，且只走 M Plan 周额度 |
 
-测试期间账号余额波动过：同一批接口先返回 `402 plan balance has run out`，
-几十分钟后又恢复正常。所以**看到 402 先查余额，不要当成接口坏了**。
+**402 是限额触顶，不是余额不足。** 上游原文写的是 "plan balance has run out …
+need to top up"，但控制台实际显示的是：
+
+```
+5 小时限额   已用 100%   4 小时 21 分后重置
+周限额       已用 10%    6 天 23 小时后重置
+图片生成     已用 1/10   （限时免费额度）
+积分         0
+```
+
+也就是**按窗口重置的滚动限额**，不是要你去充值。网关在 402 的错误 message 后面
+统一追加了一句提示，避免运维照上游原文跑去充值。调试期的正确姿势：降频等窗口重置，
+或者把重活分散到多个账号。
 网关对 402 的映射是 `HTTP 402 + code=insufficient_quota`，且**不重试、不换号**
 （换号也一样扣不到钱，重试只会放大失败）。
 
@@ -242,6 +254,64 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | 视频下发准备 | 本次因额度不足一直 `503`，未拿到最终 mp4 |
 
 默认 `upstream.timeout_seconds=600`，跑批量图与视频轮询够用；要跑 4K 多图建议调到 900。
+
+## 图片接口（OpenAI 图像协议）
+
+规范入口是 `generations`（JSON），`edits` 只是 **multipart 载体前门** —— 两者折叠成
+同一份 canonical 再打上游。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/v1/images/generations` | JSON；`image` 支持 `string` / `string[]` / `null` |
+| `POST` | `/v1/images/edits` | multipart；图片必须是**文件 part**（文本引用一律 400） |
+
+### 请求与归一化
+
+```json
+{"prompt":"把背景改成纯黑","image":["https://…/a.png"],"n":2,
+ "size":"1024x1024","response_format":"b64_json"}
+```
+
+- `prompt` 只在**无图时必填**；
+- `image` 三种写法等价；`mask` 有值必须同时有 `image`；
+- `n` 的非法值（`0` / `2.5` / `2.0` / `"3"` / `true` / `null`）**回落 1**，不报错
+  （`2.0` 也算非法：JSON 数据模型里它是整数，但服务端按 `isinstance(int)` 判定）；
+- `response_format` 只认 `url` / `b64_json`，其余**删键**（= 不干预上游形态）；
+- 其余字段一律透传，`usage` 之类不吞。
+
+### 实测尺寸矩阵（1K 档，真调上游）
+
+| 请求比例 | 实际输出 | 请求比例 | 实际输出 |
+|---|---|---|---|
+| 21:9 | 1584×672 | 3:4 | 896×1200 |
+| 16:9 | 1376×768 | 9:16 | 768×1376 |
+| 4:3 | 1200×896 | 1:1 | 1024×1024 |
+| 2K + 16:9 | 2752×1536 | 4K + 1:1 | 4096×4096（≈10MB） |
+
+`size` 只映射到「比例 + 档位」—— 上游是**矩阵不是自由 WxH**：
+`1280x720→1K/16:9`、`1536x1024→2K/4:3`、`4096x4096→4K/1:1`；`quality=hd` 显式优先。
+批量 `n=3` 实测三张各不相同且槽位对应正确。
+
+### 三处登记偏差（渠道限制，不是实现偷懒）
+
+| 偏差 | 原因 | 表现 |
+|---|---|---|
+| 有 `image` 也必须给 `prompt` | 上游强制非空 prompt（空串直接 400） | 400 `unsupported_parameter` / `param=prompt` |
+| `mask` 不支持 | 上游没有局部重绘 | 400 `unsupported_parameter` / `param=mask` |
+| `n>10` 钳到 10 | 上游单次最多 10 个槽位 | 响应带 `warnings` |
+
+### 错误归因
+
+四键信封 `{message, type, param, code}`，按「谁的错」翻：参数错 400；审核拒答
+`400 content_filter`（重试无用）；上游账号失效 `502 upstream_auth`；
+限额触顶 `402 insufficient_quota`（等窗口重置）；网络/5xx `502 upstream_error`。
+
+### 验证
+
+- **14 项端到端**：真网关二进制 + 假上游 + 官方 `image-protocol.schema.json` 机器校验，
+  覆盖文生图 / 批量 / b64 / image 数组 / image 单串 / edits 文件 / 六类拒绝 —— 全绿；
+- Go 侧 9 个用例：`n` 归一化（含 `2` vs `2.0`）、`image` 三写法、`mask` 无图、
+  `size→档位`、extras 透传、data URI 按 magic bytes 判 mime。
 
 ## 视频接口（异步视频生成协议）
 
@@ -323,7 +393,7 @@ body 字段是强校验，prompt 后缀是弱校验：
 | 额度不足 | **402** | `insufficient_quota` |
 | 网络 / 5xx | 502 | `upstream_error` |
 
-> 402 是**有意的偏离**：协议把渠道问题归到 5xx，但对自建网关来说"余额不足"和
+> 402 是**有意的偏离**：协议把渠道问题归到 5xx，但对自建网关来说"限额触顶"和
 > "上游挂了"是两种完全不同的处置，保留 402 才排得动障。
 
 ### 任务对象
@@ -388,6 +458,9 @@ internal/oauth/      设备授权（PKCE）、刷新、撤销
 internal/upstream/   上游客户端（Anthropic Messages）
 internal/media/      媒体网关客户端（/mavis/api/v1/mcp/*，业务码在 body 里）
 internal/convert/    OpenAI ⇄ Anthropic 协议转换（请求/响应/流式）
+internal/imageproto/ OpenAI 图像协议：canonical 折叠 + 上游槽位映射（纯函数）
+internal/videoproto/ 异步视频协议：canonical 折叠 + 六态收敛（纯函数）
+internal/videotask/  视频任务快照（落盘，重启可查）
 internal/pool/       账号池调度、冷却、熔断
 internal/server/     HTTP 路由、SSE、重试与换号
                      └ images.go / videos.go / audio.go：媒体路由与产物下载
