@@ -185,18 +185,61 @@ func TestAspectRatioAndResolutionReachItems(t *testing.T) {
 	}
 }
 
-// 非法取值要响亮拒绝，不能悄悄回落默认。
-func TestAspectRatioValidation(t *testing.T) {
-	for _, body := range []string{
-		`{"prompt":"x","aspect_ratio":"2:1"}`,
-		`{"prompt":"x","resolution":"8K"}`,
-	} {
-		req, perr := decode(t, body)
-		if perr != nil {
-			t.Fatalf("Decode: %+v", perr)
+// 比例吸附：任意 W:H 都要落到六种之一，而不是让上游运行时失败。
+func TestSnapRatio(t *testing.T) {
+	cases := map[string]string{
+		"21:9": "21:9", "16:9": "16:9", "4:3": "4:3", "1:1": "1:1",
+		"3:4": "3:4", "9:16": "9:16",
+		"2:1": "16:9", "7:3": "21:9", "3:2": "4:3", "16/9": "16:9",
+		"1.85:1": "16:9",
+	}
+	for in, want := range cases {
+		got, ok := SnapRatio(in)
+		if !ok || got != want {
+			t.Fatalf("SnapRatio(%q) = %q,%v，期望 %q", in, got, ok, want)
 		}
-		if _, _, perr := req.Build(); perr == nil || perr.Status != 400 {
-			t.Fatalf("%s: 应 400，实际 %+v", body, perr)
+	}
+	if _, ok := SnapRatio("abc"); ok {
+		t.Fatalf("abc 不该可解析")
+	}
+}
+
+// 档位吸附：常见 p 写法与裸像素都要落到 1K/2K/4K。
+func TestSnapResolution(t *testing.T) {
+	cases := map[string]string{
+		"1K": "1K", "2K": "2K", "4K": "4K", "2k": "2K",
+		"480p": "1K", "720p": "1K", "1080p": "1K",
+		"1440p": "2K", "2160p": "4K", "8K": "4K",
+		"1024": "1K", "2048": "2K", "4096": "4K",
+	}
+	for in, want := range cases {
+		got, ok := SnapResolution(in)
+		if !ok || got != want {
+			t.Fatalf("SnapResolution(%q) = %q,%v，期望 %q", in, got, ok, want)
 		}
+	}
+	if _, ok := SnapResolution("abc"); ok {
+		t.Fatalf("abc 不该可解析")
+	}
+}
+
+// 吸附后要写进槽位并留 warning；完全无法解析才 400。
+func TestAspectRatioSnapped(t *testing.T) {
+	req, _ := decode(t, `{"prompt":"x","aspect_ratio":"2:1","resolution":"8K"}`)
+	payload, warns, perr := req.Build()
+	if perr != nil {
+		t.Fatalf("Build: %+v", perr)
+	}
+	item := payload["requests"].([]map[string]any)[0]
+	if item["aspect_ratio"] != "16:9" || item["resolution"] != "4K" {
+		t.Fatalf("未吸附到合法值: %v", item)
+	}
+	if len(warns) != 2 {
+		t.Fatalf("两个字段都该有 warning，实际 %v", warns)
+	}
+
+	req, _ = decode(t, `{"prompt":"x","aspect_ratio":"abc"}`)
+	if _, _, perr := req.Build(); perr == nil || perr.Status != 400 {
+		t.Fatalf("无法解析的比例应 400，实际 %+v", perr)
 	}
 }
