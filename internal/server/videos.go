@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -30,6 +31,13 @@ const maxVideoBody = 64 << 20
 // createVideoTask 建任务。POST 200 只代表受理，成功与否要看后续 status。
 func (s *Server) createVideoTask(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	// 预算从请求入口开始计时：提交 + 等待共享同一个预算，否则实际耗时
+	// 会变成「提交耗时 + wait_timeout」，客户端算不准超时。
+	wait, waitFor := waitBudget(r)
+	var deadline time.Time
+	if wait {
+		deadline = start.Add(waitFor)
+	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxVideoBody))
 	if err != nil {
 		writeProtoError(w, &videoproto.ProtocolError{
@@ -106,28 +114,67 @@ func (s *Server) createVideoTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logMedia(r, req.Model, http.StatusOK, start, nil)
-	w.Header().Set("Location", "/v1/contents/generations/tasks/"+rec.ID)
-	// 契约：创建响应只有 id。warnings 挂在任务对象上（GET 可见），不污染这里。
+
+	// 同步折叠：?wait=1 时在预算内等终态；超时降级 202（不取消任务）。
+	// 不等待时严格按契约只回 id，warnings 挂在任务对象上（GET 可见）。
+	if wait {
+		rec = s.waitForVideoTask(r.Context(), rec, deadline)
+		writeWaitResult(w, r, rec)
+		return
+	}
+	w.Header().Set("Location", prefixOf(r)+"/contents/generations/tasks/"+rec.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"id": rec.ID})
 }
 
-// getVideoTask 查询任务，返回 canonical 任务对象。
-func (s *Server) getVideoTask(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
-	rec, ok := s.VideoTasks.Get(id)
-	if !ok {
-		writeProtoError(w, &videoproto.ProtocolError{
-			Status: http.StatusNotFound, Type: "invalid_request_error",
-			Param: "id", Code: "task_not_found",
-			Message: "没有这个任务：" + id + "（网关只认识自己创建过的任务）",
-		})
-		return
-	}
+// 轮询退避参数。抽成变量是为了测试能把等待压到毫秒级。
+var (
+	videoPollStart = 2 * time.Second
+	videoPollMax   = 10 * time.Second
+)
 
-	raw, err := s.callMedia(r.Context(), media.ToolVideoQuery, map[string]any{
-		"task_id":          id,
+// prefixOf 判断客户端用的是哪套前缀，Location 回同样的。
+func prefixOf(r *http.Request) string {
+	if strings.HasPrefix(r.URL.Path, "/api/v3/") {
+		return "/api/v3"
+	}
+	return "/v1"
+}
+
+// waitBudget 解析同步折叠参数。
+//
+//	?wait=1&wait_timeout=60   最多在服务端等 60 秒
+//
+// 上限 300 秒：再长就不是"折叠"而是挂连接了，客户端应该自己轮询。
+func waitBudget(r *http.Request) (bool, time.Duration) {
+	q := r.URL.Query()
+	v := strings.ToLower(strings.TrimSpace(q.Get("wait")))
+	if v == "" || v == "0" || v == "false" {
+		return false, 0
+	}
+	sec := 60
+	if raw := strings.TrimSpace(q.Get("wait_timeout")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			sec = n
+		}
+	}
+	if sec < 1 {
+		sec = 1
+	}
+	if sec > 300 {
+		sec = 300
+	}
+	return true, time.Duration(sec) * time.Second
+}
+
+// refreshVideoTask 查一次上游并把结果合并进记录。
+//
+// 这是唯一一处「上游状态 → canonical 状态」的地方：查询端点、同步门都走它，
+// 避免两条路径对同一份响应给出不同解释。
+func (s *Server) refreshVideoTask(ctx context.Context, rec *videotask.Record) (*videotask.Record, *videoproto.ProtocolError) {
+	raw, err := s.callMedia(ctx, media.ToolVideoQuery, map[string]any{
+		"task_id":          rec.ID,
 		"model":            rec.UpstreamModel,
-		"output_file_path": "videos/" + id + ".mp4",
+		"output_file_path": "videos/" + rec.ID + ".mp4",
 	})
 
 	var q struct {
@@ -147,19 +194,17 @@ func (s *Server) getVideoTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(raw) > 0 {
 		if uerr := json.Unmarshal(raw, &q); uerr != nil && err == nil {
-			writeProtoError(w, &videoproto.ProtocolError{
+			return rec, &videoproto.ProtocolError{
 				Status: http.StatusBadGateway, Type: "upstream_error",
 				Code: "bad_upstream", Message: "上游响应无法解析: " + uerr.Error(),
-			})
-			return
+			}
 		}
 	}
 
 	// 观测期失败（网络/5xx）不该被当成任务失败，直接透出可重试的错误。
 	var me *media.Error
 	if err != nil && !(errors.As(err, &me) && me.IsPoll()) {
-		writeProtoError(w, protoFromMedia(err))
-		return
+		return rec, protoFromMedia(err)
 	}
 
 	status, unnormalized := videoproto.MapStatus(firstNonEmptyStr(q.Status, q.Data.Status))
@@ -185,7 +230,99 @@ func (s *Server) getVideoTask(w http.ResponseWriter, r *http.Request) {
 		rec.UsageTotal = q.Usage.TotalTokens
 	}
 	s.VideoTasks.Put(rec)
+	return rec, nil
+}
 
+// waitForVideoTask 同步折叠：在预算内一直查到终态。
+//
+// 预算耗尽是**降级**（202 + 当前状态 + Location），不是失败、更不取消任务。
+// 中途的传输错误也吞掉继续等 —— 一次网络抖动不该把 60 秒的等待判死。
+func (s *Server) waitForVideoTask(ctx context.Context, rec *videotask.Record, deadline time.Time) *videotask.Record {
+	if videoproto.IsTerminal(rec.Status) {
+		return rec
+	}
+	interval := videoPollStart
+	for {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return rec
+		}
+		wait := interval
+		if wait > remain {
+			wait = remain
+		}
+		select {
+		case <-ctx.Done():
+			return rec
+		case <-time.After(wait):
+		}
+
+		// 单次查询也要被预算约束：上游一次查询可能要 1-2 秒，
+		// 不设超时的话最后一次查询会把总耗时顶出 wait_timeout。
+		left := time.Until(deadline)
+		if left <= 0 {
+			return rec
+		}
+		qctx, cancel := context.WithTimeout(ctx, left)
+		next, perr := s.refreshVideoTask(qctx, rec)
+		cancel()
+		if perr != nil {
+			// 观测期错误可重试：记一笔继续等，预算用完自然降级。
+			log.Printf("video task %s 轮询出错（继续等待）: %s", rec.ID, perr.Message)
+		} else {
+			rec = next
+			if videoproto.IsTerminal(rec.Status) {
+				return rec
+			}
+		}
+		interval = time.Duration(float64(interval) * 1.5)
+		if interval > videoPollMax {
+			interval = videoPollMax
+		}
+	}
+}
+
+// writeWaitResult 终态回任务对象；未终态回 202 + {id,status} + Location。
+func writeWaitResult(w http.ResponseWriter, r *http.Request, rec *videotask.Record) {
+	if videoproto.IsTerminal(rec.Status) {
+		writeJSON(w, http.StatusOK, taskObject(rec))
+		return
+	}
+	w.Header().Set("Location", prefixOf(r)+"/contents/generations/tasks/"+rec.ID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"id": rec.ID, "status": rec.Status})
+}
+
+// getVideoTask 查询任务，返回 canonical 任务对象。
+// 带 ?wait=1 时先做同步折叠，超时降级 202。
+func (s *Server) getVideoTask(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	wait, waitFor := waitBudget(r)
+	var deadline time.Time
+	if wait {
+		deadline = start.Add(waitFor)
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	rec, ok := s.VideoTasks.Get(id)
+	if !ok {
+		writeProtoError(w, &videoproto.ProtocolError{
+			Status: http.StatusNotFound, Type: "invalid_request_error",
+			Param: "id", Code: "task_not_found",
+			Message: "没有这个任务：" + id + "（网关只认识自己创建过的任务）",
+		})
+		return
+	}
+
+	rec, perr := s.refreshVideoTask(r.Context(), rec)
+	if perr != nil {
+		writeProtoError(w, perr)
+		return
+	}
+
+	if wait && !videoproto.IsTerminal(rec.Status) {
+		rec = s.waitForVideoTask(r.Context(), rec, deadline)
+		writeWaitResult(w, r, rec)
+		return
+	}
 	writeJSON(w, http.StatusOK, taskObject(rec))
 }
 
@@ -355,7 +492,7 @@ func protoFromMedia(err error) *videoproto.ProtocolError {
 	case me.IsBilling():
 		return &videoproto.ProtocolError{
 			Status: http.StatusPaymentRequired, Type: "api_error",
-			Code: "insufficient_quota", Message: me.Message,
+			Code: "insufficient_quota", Message: billingHint(me.Message),
 		}
 	case me.IsRequest():
 		return &videoproto.ProtocolError{

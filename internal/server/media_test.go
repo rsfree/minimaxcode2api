@@ -154,15 +154,99 @@ func TestImagesAllFailedIs502(t *testing.T) {
 	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":0,"total_success":0,"total_failed":1,
-			"success_items":[],"failed_items":[{"output_file":"slot_0.png","error_msg":"prompt 违规"}]}`)
+			"success_items":[],"failed_items":[{"output_file":"slot_0.png","error_msg":"upstream internal error"}]}`)
 	}, "tok1")
 
 	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("状态码 = %d，期望 502，body=%s", resp.StatusCode, raw)
 	}
-	if !strings.Contains(string(raw), "prompt 违规") {
+	if !strings.Contains(string(raw), "upstream internal error") {
 		t.Fatalf("上游错误信息没透出: %s", raw)
+	}
+}
+
+// 审核拒答要归因成 400 content_filter —— 重试无用，客户端应改内容。
+func TestImagesContentFilterIs400(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":0,"total_success":0,"total_failed":1,
+			"success_items":[],"failed_items":[{"output_file":"slot_0.png","error_msg":"prompt 违规"}]}`)
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "content_filter") {
+		t.Fatalf("应归因成 content_filter: %s", raw)
+	}
+}
+
+// edits 入口：文本引用是非法载体，必须 400 且不打上游。
+func TestImageEditsRejectsTextReference(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("非法载体不该打到上游")
+	}, "tok1")
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("image", "https://example.com/a.png")
+	_ = mw.WriteField("prompt", "改成水彩")
+	_ = mw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, f.front.URL+"/v1/images/edits", &buf)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	}
+}
+
+// edits 入口：文件 part 折成 data URI 后走同一条 canonical。
+func TestImageEditsFilePart(t *testing.T) {
+	var got map[string]any
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":0,"success_items":[{"output_file":"slot_0.png",
+			"output_url":"https://cdn.test/out.png","has_image_output":true}]}`)
+	}, "tok1")
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, _ := mw.CreateFormFile("image", "a.png")
+	_, _ = part.Write([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0}) // JPEG 头
+	_ = mw.WriteField("prompt", "改成水彩")
+	_ = mw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, f.front.URL+"/v1/images/edits", &buf)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+
+	reqs, _ := got["requests"].([]any)
+	if len(reqs) != 1 {
+		t.Fatalf("上游槽位 = %v", got)
+	}
+	item, _ := reqs[0].(map[string]any)
+	urls, _ := item["input_urls"].([]any)
+	if len(urls) != 1 || !strings.HasPrefix(urls[0].(string), "data:image/jpeg;base64,") {
+		t.Fatalf("文件未折成 data URI: %v", item["input_urls"])
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/videoproto"
 	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
@@ -340,3 +342,140 @@ func (f *fixture) do(t *testing.T, method, path, body string) (*http.Response, [
 }
 
 var _ = httptest.NewServer
+
+// 同步折叠：预算内等到终态 → 200 + 完整任务对象（同一个序列化器）。
+func TestVideoWaitReturnsTerminal(t *testing.T) {
+	oldStart, oldMax := videoPollStart, videoPollMax
+	videoPollStart, videoPollMax = 5*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { videoPollStart, videoPollMax = oldStart, oldMax })
+
+	var mu sync.Mutex
+	polls := 0
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		polls++
+		n := polls
+		mu.Unlock()
+		if n < 2 {
+			io.WriteString(w, `{"code":0,"status":"running"}`)
+			return
+		}
+		io.WriteString(w, `{"code":0,"status":"succeeded","video_url":"https://cdn.test/v.mp4"}`)
+	}, "tok1")
+
+	f.srv.VideoTasks.Put(&videotask.Record{
+		ID: "w-1", ClientModel: "MiniMax-Hailuo-2.3", UpstreamModel: videoproto.UpstreamHailuo,
+		Status: videoproto.StatusQueued, CreatedAt: 1, UpdatedAt: 1,
+	})
+
+	resp, raw := f.get(t, videoTaskPath+"/w-1?wait=1&wait_timeout=5")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200，body=%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	if out["status"] != "succeeded" {
+		t.Fatalf("status = %v，期望 succeeded", out["status"])
+	}
+	content, _ := out["content"].(map[string]any)
+	if content["video_url"] != "https://cdn.test/v.mp4" {
+		t.Fatalf("video_url = %v", content["video_url"])
+	}
+	if len(out) == 2 {
+		t.Fatalf("终态应回完整任务对象，不是 {id,status}: %s", raw)
+	}
+}
+
+// 预算耗尽：202 + {id,status} + Location，不取消任务。
+func TestVideoWaitDegradesTo202(t *testing.T) {
+	oldStart, oldMax := videoPollStart, videoPollMax
+	videoPollStart, videoPollMax = 10*time.Millisecond, 30*time.Millisecond
+	t.Cleanup(func() { videoPollStart, videoPollMax = oldStart, oldMax })
+
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"code":0,"status":"running"}`)
+	}, "tok1")
+
+	f.srv.VideoTasks.Put(&videotask.Record{
+		ID: "w-2", ClientModel: "MiniMax-H3", UpstreamModel: videoproto.UpstreamH3,
+		Status: videoproto.StatusRunning, CreatedAt: 1, UpdatedAt: 1,
+	})
+
+	resp, raw := f.get(t, videoTaskPath+"/w-2?wait=1&wait_timeout=1")
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("状态码 = %d，期望 202，body=%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	if len(out) != 2 || out["id"] != "w-2" || out["status"] != "running" {
+		t.Fatalf("降级响应必须是 {id,status}，实际 %v", out)
+	}
+	if loc := resp.Header.Get("Location"); loc != videoTaskPath+"/w-2" {
+		t.Fatalf("Location = %q", loc)
+	}
+	// 降级不等于取消：记录还在，状态仍是 running。
+	if rec, ok := f.srv.VideoTasks.Get("w-2"); !ok || rec.Status != "running" {
+		t.Fatalf("降级后任务记录被改动: %+v", rec)
+	}
+}
+
+// 创建即折叠：POST ?wait=1 成功时回完整对象；不等时只回 id。
+func TestVideoCreateWithWait(t *testing.T) {
+	oldStart, oldMax := videoPollStart, videoPollMax
+	videoPollStart, videoPollMax = 5*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { videoPollStart, videoPollMax = oldStart, oldMax })
+
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mcp/submit_video_generation":
+			io.WriteString(w, `{"code":0,"task_id":"cgt-wait"}`)
+		case "/mcp/query_video_generation":
+			io.WriteString(w, `{"code":0,"status":"succeeded","video_url":"https://cdn.test/v.mp4"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}, "tok1")
+
+	resp, raw := f.post(t, videoTaskPath+"?wait=1&wait_timeout=5",
+		`{"model":"MiniMax-H3","content":[{"type":"text","text":"x"}],"duration":4}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	if out["status"] != "succeeded" || out["id"] != "cgt-wait" {
+		t.Fatalf("折叠失败: %s", raw)
+	}
+	if _, ok := out["content"]; !ok {
+		t.Fatalf("折叠成功必须回完整任务对象: %s", raw)
+	}
+}
+
+// 参数解析：默认 60 秒，钳位 [1,300]，wait=0/false 视为不等待。
+func TestWaitBudgetParsing(t *testing.T) {
+	mk := func(q string) (bool, time.Duration) {
+		r := httptest.NewRequest(http.MethodGet, "/x"+q, nil)
+		return waitBudget(r)
+	}
+	if on, _ := mk(""); on {
+		t.Fatalf("没有 wait 参数时不该等待")
+	}
+	if on, _ := mk("?wait=0"); on {
+		t.Fatalf("wait=0 不该等待")
+	}
+	if on, _ := mk("?wait=false"); on {
+		t.Fatalf("wait=false 不该等待")
+	}
+	if on, d := mk("?wait=1"); !on || d != 60*time.Second {
+		t.Fatalf("默认预算 = %v", d)
+	}
+	if _, d := mk("?wait=1&wait_timeout=9999"); d != 300*time.Second {
+		t.Fatalf("上限应钳到 300s，实际 %v", d)
+	}
+	if _, d := mk("?wait=1&wait_timeout=-5"); d != time.Second {
+		t.Fatalf("下限应钳到 1s，实际 %v", d)
+	}
+}

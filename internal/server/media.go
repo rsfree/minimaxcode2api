@@ -114,6 +114,9 @@ func writeMediaError(w http.ResponseWriter, err error) {
 	msg := err.Error()
 	if me != nil && me.Message != "" {
 		msg = me.Message
+		if me.IsBilling() {
+			msg = billingHint(msg)
+		}
 	}
 	writeOpenAIError(w, status, code, msg)
 }
@@ -170,6 +173,23 @@ func sniffMime(b []byte, fallback string) string {
 		return fallback
 	}
 	return "application/octet-stream"
+}
+
+// billingHint 给 402 补一句"这是限额不是余额"。
+//
+// 上游原文是 "plan balance has run out … need to top up"，但控制台实际显示的是
+// 「5 小时限额 100% / 周限额 10%，按窗口重置」。照抄原文会把运维带向"去充值"，
+// 而真实处置是等窗口重置（或降频）。
+func billingHint(msg string) string {
+	return msg + "【提示】这是账号的 5 小时/周限额触顶，不是余额不足；" +
+		"额度按窗口重置，重置后自动恢复（控制台可看剩余重置时间）"
+}
+
+// logMedia 记一条媒体请求日志（含来源 IP/UA）。
+func (s *Server) logMedia(r *http.Request, model string, status int, start time.Time, err error) {
+	e := reqlogEntry(r, model, status, start, err)
+	e.ClientIP, e.UA = s.clientInfo(r)
+	s.Logs.Add(e)
 }
 
 // reqlogEntry 组一条媒体请求日志。

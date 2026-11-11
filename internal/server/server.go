@@ -93,6 +93,8 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
 	// 媒体接口：上游是 /mavis/api/v1/mcp/*，鉴权与文本一致。
 	s.Mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
+	// edits 是载体前门（multipart 文件），和 generations 折叠成同一份 canonical。
+	s.Mux.HandleFunc("POST /v1/images/edits", s.auth(s.handleImageEdits))
 	// 视频走「异步视频生成协议」的 canonical 路径。同时挂 /v1 与 /api/v3：
 	// 前者是本网关的惯例，后者让 Ark SDK 只需改 base_url 就能直接用。
 	for _, prefix := range []string{"/v1", "/api/v3"} {
