@@ -59,6 +59,10 @@
   let toastTimer = null;
   const toast = (msg, isErr = false) => {
     const t = $('#toast');
+    // 🔴 hidden 必须显式去掉：CSS 里有 [hidden]{display:none!important}，
+    // 只改 className 的话提示永远是隐藏的 —— 之前面板所有操作都"没有反馈"，
+    // 根因就在这里（toast 元素带 hidden 属性，JS 从没移除过）。
+    t.hidden = false;
     t.textContent = msg;
     t.className = 'toast show' + (isErr ? ' err' : '');
     clearTimeout(toastTimer);
@@ -364,7 +368,7 @@
         } catch (err) { toast(err.message, true); }
       }));
 
-      ops.appendChild(opBtn('恢复', async () => {
+      ops.appendChild(opBtn('清冷却', async () => {
         try {
           await api(`/panel/api/accounts/${encodeURIComponent(a.id)}/reset`, { method: 'POST', body: '{}' });
           toast('已清除冷却与错误');
