@@ -250,7 +250,7 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 		warnings = append(warnings, fmt.Sprintf("n=%d 超过上游单次上限，已按 %d 张生成", r.N, maxSlots))
 	}
 
-	ratio, resolution := Shape(r.Size, r.Quality, r.Model)
+	ratio, resolution := Shape(r.Size, r.Quality)
 	// 上游原生字段优先于 size/quality 推导（显式 > 推导）。
 	//
 	// 这里做「客户端吸附」而不是严格拒绝：上游确实会吸附，但方式不可靠 ——
@@ -316,7 +316,7 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 //
 // 上游是"档位 × 比例"的矩阵，不是自由 WxH：档位 1K/2K/4K，比例 21:9/16:9/4:3/
 // 1:1/3:4/9:16。所以自由像素必须先换算，换算不了就按最近档 —— 绝不能原样发。
-func Shape(size, quality, model string) (ratio, resolution string) {
+func Shape(size, quality string) (ratio, resolution string) {
 	ratio = ratioFromSize(size)
 	if ratio == "" {
 		ratio = "1:1"
@@ -390,20 +390,12 @@ func SnapResolution(v string) (string, bool) {
 		return "", false
 	}
 	// 三种写法语义不同，必须分开判：
-	//   `4k`  → 长边 ≈ 4096（乘 1024）
-	//   `1080p` → 1080 是高度，1K 档的 16:9 实测 1376×768，所以 1080p 落 1K
-	//   裸数字 → 当长边像素看
+	//   `4k`    → 长边 ≈ 4096（乘 1024 后再按长边判）
+	//   `1080p` → 1080 是**高度**，按高度判（1K 档的 16:9 实测就是 1376×768）
+	//   裸数字  → 当长边像素看
 	switch suffix := s[i:]; {
 	case strings.HasPrefix(suffix, "k"):
-		px := num * 1024
-		switch {
-		case px < 1600:
-			return "1K", true
-		case px < 3200:
-			return "2K", true
-		default:
-			return "4K", true
-		}
+		return resolutionFromLongest(num * 1024), true
 	case strings.HasPrefix(suffix, "p"):
 		switch {
 		case num <= 1200:
@@ -414,14 +406,29 @@ func SnapResolution(v string) (string, bool) {
 			return "4K", true
 		}
 	default:
-		switch {
-		case num < 1600:
-			return "1K", true
-		case num < 3200:
-			return "2K", true
-		default:
-			return "4K", true
-		}
+		return resolutionFromLongest(num), true
+	}
+}
+
+// resolutionFromLongest 是**唯一**的「长边像素 → 档位」阈值表。
+//
+// 阈值来自实测输出（三档都是像素预算，不是固定边长）：
+//
+//	1K ≈ 1.05MP（1:1=1024²、16:9=1376×768、21:9=1584×672）
+//	2K ≈ 4.2MP （16:9=2752×1536）
+//	4K ≈ 16.9MP（16:9=5504×3072）
+//
+// 所以分界取档位边长的几何中点附近：1400 / 2800。
+// 单独抽出来是为了避免「size 走一套阈值、resolution 走另一套」——
+// 曾经 1536x1024 判 2K 而 resolution="1536" 判 1K，同一个数字两个答案。
+func resolutionFromLongest(longest float64) string {
+	switch {
+	case longest > 2800:
+		return "4K"
+	case longest > 1400:
+		return "2K"
+	default:
+		return "1K"
 	}
 }
 
@@ -436,36 +443,17 @@ func resolutionFromSize(size string) string {
 	if h > longest {
 		longest = h
 	}
-	switch {
-	case longest > 2800:
-		return "4K"
-	case longest > 1400:
-		return "2K"
-	default:
-		return "1K"
-	}
+	return resolutionFromLongest(float64(longest))
 }
 
-// ratioFromSize 找最近的合法比例（对数距离）。上游只认六种比例。
+// ratioFromSize 找最近的合法比例。上游只认六种比例，所以 size 也要吸附。
+// 直接复用 SnapRatio，避免两处各维护一份比例表（改一处忘一处就会分叉）。
 func ratioFromSize(size string) string {
 	w, h, ok := parseWH(size)
 	if !ok {
 		return ""
 	}
-	allowed := []struct {
-		label string
-		value float64
-	}{
-		{"21:9", 21.0 / 9.0}, {"16:9", 16.0 / 9.0}, {"4:3", 4.0 / 3.0},
-		{"1:1", 1}, {"3:4", 3.0 / 4.0}, {"9:16", 9.0 / 16.0},
-	}
-	target := math.Log(float64(w) / float64(h))
-	best, bestDiff := "1:1", math.MaxFloat64
-	for _, a := range allowed {
-		if d := math.Abs(math.Log(a.value) - target); d < bestDiff {
-			best, bestDiff = a.label, d
-		}
-	}
+	best, _ := SnapRatio(strconv.Itoa(w) + ":" + strconv.Itoa(h))
 	return best
 }
 

@@ -143,7 +143,7 @@ func TestShape(t *testing.T) {
 		{"", "", "1:1", "1K"},
 	}
 	for _, c := range cases {
-		ratio, res := Shape(c.size, c.quality, "")
+		ratio, res := Shape(c.size, c.quality)
 		if ratio != c.ratio || res != c.res {
 			t.Fatalf("Shape(%q,%q) = %s/%s，期望 %s/%s", c.size, c.quality, ratio, res, c.ratio, c.res)
 		}
@@ -241,5 +241,38 @@ func TestAspectRatioSnapped(t *testing.T) {
 	req, _ = decode(t, `{"prompt":"x","aspect_ratio":"abc"}`)
 	if _, _, perr := req.Build(); perr == nil || perr.Status != 400 {
 		t.Fatalf("无法解析的比例应 400，实际 %+v", perr)
+	}
+}
+
+// 同一个数字必须只有一个答案：size 推导与 resolution 吸附不能分叉。
+// 曾经 size=1536x1024 判 2K，而 resolution="1536" 判 1K（两套阈值表）。
+func TestSizeAndResolutionAgree(t *testing.T) {
+	for _, longest := range []string{
+		"512", "1024", "1280", "1376", "1400", "1401", "1440", "1536",
+		"2048", "2752", "2800", "2801", "3840", "4096", "5504", "8192",
+	} {
+		fromSize := resolutionFromSize(longest + "x100")
+		fromRes, ok := SnapResolution(longest)
+		if !ok {
+			t.Fatalf("SnapResolution(%q) 无法解析", longest)
+		}
+		if fromSize != fromRes {
+			t.Fatalf("长边 %s：size 推导=%s，resolution 吸附=%s —— 必须一致",
+				longest, fromSize, fromRes)
+		}
+	}
+}
+
+// size 的比例也走同一份六比例表（ratioFromSize 复用 SnapRatio）。
+func TestRatioFromSizeSnaps(t *testing.T) {
+	cases := map[string]string{
+		"1024x1024": "1:1", "1920x1080": "16:9", "3840x1600": "21:9",
+		"1024x1536": "3:4", "1080x1920": "9:16", "1200x896": "4:3",
+		"": "",
+	}
+	for size, want := range cases {
+		if got := ratioFromSize(size); got != want {
+			t.Fatalf("ratioFromSize(%q) = %q，期望 %q", size, got, want)
+		}
 	}
 }
