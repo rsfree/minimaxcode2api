@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>MiniMax Code 2 API · 管理台</title>
+<link rel="icon" href="/panel/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body>
+
+<!-- 登录门 -->
+<div id="gate" class="gate" hidden>
+  <form id="gate-form" class="gate-card" autocomplete="off">
+    <div class="gate-logo">
+      <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true">
+        <defs>
+          <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#4c8dff"/>
+            <stop offset="100%" stop-color="#2ee6f6"/>
+          </linearGradient>
+        </defs>
+        <circle cx="24" cy="24" r="20" fill="url(#lg)"/>
+        <circle cx="17" cy="21" r="3.2" fill="#fff" opacity=".9"/>
+        <circle cx="31" cy="21" r="3.2" fill="#fff" opacity=".9"/>
+      </svg>
+    </div>
+    <h1>MiniMax Code 2 API</h1>
+    <p class="muted">输入管理口令（config 里的 api_key 或 admin_password）</p>
+    <input id="gate-key" type="password" placeholder="管理口令" required autofocus>
+    <button type="submit" class="btn btn-primary btn-block">进入管理台</button>
+    <p id="gate-err" class="err-text" hidden></p>
+  </form>
+</div>
+
+<!-- 主界面 -->
+<div id="shell" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 48 48" width="28" height="28" aria-hidden="true">
+        <circle cx="24" cy="24" r="20" fill="url(#lg)"/>
+        <circle cx="17" cy="21" r="3.2" fill="#fff" opacity=".9"/>
+        <circle cx="31" cy="21" r="3.2" fill="#fff" opacity=".9"/>
+      </svg>
+      <div>
+        <strong>MiniMax Code</strong>
+        <span>2 API</span>
+      </div>
+    </div>
+    <nav id="nav">
+      <a href="#/overview" data-view="overview" class="active">
+        <span class="ico">◎</span>概览
+      </a>
+      <a href="#/accounts" data-view="accounts">
+        <span class="ico">◍</span>账号
+      </a>
+      <a href="#/models" data-view="models">
+        <span class="ico">◇</span>模型
+      </a>
+      <a href="#/logs" data-view="logs">
+        <span class="ico">≡</span>请求日志
+      </a>
+      <a href="#/settings" data-view="settings">
+        <span class="ico">⚙</span>设置
+      </a>
+    </nav>
+    <div class="sidebar-foot">
+      <span id="ver">v—</span>
+      <button id="logout" class="link-btn">退出</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- 概览 -->
+    <section id="view-overview" class="view active">
+      <header class="page-head">
+        <div>
+          <h2>概览</h2>
+          <p class="muted">网关运行状态与今日用量</p>
+        </div>
+        <div class="head-actions">
+          <button id="probe-btn" class="btn">连通性自检</button>
+          <button id="refresh-overview" class="btn">刷新</button>
+        </div>
+      </header>
+
+      <div class="stats" id="stats"></div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h3>用量趋势</h3><span class="muted small">最近 14 天</span></div>
+          <div id="chart" class="chart"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>接入信息</h3></div>
+          <div id="endpoints" class="kv-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 账号 -->
+    <section id="view-accounts" class="view">
+      <header class="page-head">
+        <div>
+          <h2>账号</h2>
+          <p class="muted">MiniMax Code OAuth 账号池</p>
+        </div>
+        <div class="head-actions">
+          <button id="add-account" class="btn btn-primary">添加账号</button>
+          <button id="refresh-accounts" class="btn">刷新</button>
+        </div>
+      </header>
+      <div class="card">
+        <div id="accounts-table" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <!-- 模型 -->
+    <section id="view-models" class="view">
+      <header class="page-head">
+        <div>
+          <h2>模型</h2>
+          <p class="muted">上游模型能力与对外别名</p>
+        </div>
+        <button id="refresh-models" class="btn">刷新</button>
+      </header>
+      <div class="card"><div id="models-body"></div></div>
+    </section>
+
+    <!-- 日志 -->
+    <section id="view-logs" class="view">
+      <header class="page-head">
+        <div>
+          <h2>请求日志</h2>
+          <p class="muted">最近请求（进程内环形缓冲，重启清空）</p>
+        </div>
+        <div class="head-actions">
+          <label class="switch"><input type="checkbox" id="log-auto"><span>自动刷新</span></label>
+          <button id="refresh-logs" class="btn">刷新</button>
+        </div>
+      </header>
+      <div class="card"><div id="logs-body" class="table-wrap"></div></div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="view-settings" class="view">
+      <header class="page-head">
+        <div>
+          <h2>设置</h2>
+          <p class="muted">保存后立即生效（配置写回 config.json）</p>
+        </div>
+        <button id="save-config" class="btn btn-primary">保存</button>
+      </header>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h3>对外接口</h3></div>
+          <div class="form">
+            <label>API Key<input id="cfg-api-key" type="text" placeholder="留空则不修改"></label>
+            <label>面板口令<input id="cfg-admin-password" type="text" placeholder="留空则用 API Key"></label>
+            <label>默认模型<input id="cfg-default-model" type="text"></label>
+            <label>默认 max_tokens<input id="cfg-max-tokens" type="number" min="1"></label>
+            <label>思考策略
+              <select id="cfg-thinking">
+                <option value="auto">auto（M3 关闭 / M3.1 自适应）</option>
+                <option value="off">off（尽量关闭）</option>
+                <option value="on">on（M3 开启思考）</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>账号池</h3></div>
+          <div class="form">
+            <label>调度策略
+              <select id="cfg-strategy">
+                <option value="weighted">weighted（空闲优先）</option>
+                <option value="round_robin">round_robin（轮询）</option>
+              </select>
+            </label>
+            <label>全局并发上限<input id="cfg-inflight" type="number" min="1"></label>
+            <label>单账号并发上限<input id="cfg-inflight-acct" type="number" min="1"></label>
+            <label>模型别名（JSON）<textarea id="cfg-aliases" rows="5" spellcheck="false"></textarea></label>
+          </div>
+        </div>
+      </div>
+      <div class="card danger-zone">
+        <div class="card-head"><h3>危险操作</h3></div>
+        <p class="muted small">清空本地账号凭证不会撤销服务端授权，账号仍可在别处使用。</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 添加账号弹窗 -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>添加账号</h3>
+      <button id="modal-close" class="icon-btn" aria-label="关闭">✕</button>
+    </div>
+    <div class="tabs" id="add-tabs">
+      <button class="tab active" data-tab="device">设备授权</button>
+      <button class="tab" data-tab="import">粘贴 Token</button>
+    </div>
+
+    <div id="tab-device" class="tab-panel active">
+      <p class="muted small">点击下方按钮生成授权码，在浏览器打开验证页并确认，网关会自动接管。</p>
+      <button id="device-start" class="btn btn-primary btn-block">生成授权码</button>
+      <div id="device-box" class="device-box" hidden>
+        <div class="device-code" id="device-code">————</div>
+        <a id="device-link" class="btn btn-block" target="_blank" rel="noopener">打开验证页</a>
+        <p class="muted small" id="device-status">等待授权…</p>
+      </div>
+    </div>
+
+    <div id="tab-import" class="tab-panel">
+      <p class="muted small">从已登录客户端导出 <code>auth.json</code>，粘贴 refresh_token 即可；也可只贴临时 access_token。</p>
+      <label>refresh_token<textarea id="import-refresh" rows="3" spellcheck="false" placeholder="mmort_…"></textarea></label>
+      <label>access_token（可选）<textarea id="import-access" rows="2" spellcheck="false" placeholder="mmoat_…"></textarea></label>
+      <label>备注名<input id="import-label" type="text" placeholder="例如 主号"></label>
+      <button id="import-submit" class="btn btn-primary btn-block">导入</button>
+    </div>
+    <p id="modal-err" class="err-text" hidden></p>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>

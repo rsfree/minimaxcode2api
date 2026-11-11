@@ -1,0 +1,7 @@
+.git
+.gitignore
+data
+config.json
+.env
+README.md
+*.md
