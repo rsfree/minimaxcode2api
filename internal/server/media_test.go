@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 )
 
 // get 发一个带鉴权的 GET（fixture 只提供了 POST 助手）。
@@ -178,5 +180,34 @@ func TestImagesContentFilterIs400(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "content_filter") {
 		t.Fatalf("应归因成 content_filter: %s", raw)
+	}
+}
+
+// 池的两种容量错误在媒体链路上必须与文本链路同口径：
+// 没账号 → 503 no_account；全冷却/在途满 → 429 all_accounts_busy。
+// 两者都要带 Retry-After，否则客户端会把冷却当 5xx 重试风暴。
+func TestMediaCapacityErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"无账号", pool.ErrNoAccount, http.StatusServiceUnavailable, "no_account"},
+		{"全冷却", pool.ErrAllBusy, http.StatusTooManyRequests, "all_accounts_busy"},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		writeMediaError(w, c.err)
+		raw := w.Body.String()
+		if w.Code != c.status {
+			t.Fatalf("%s: 状态码 = %d，期望 %d，body=%s", c.name, w.Code, c.status, raw)
+		}
+		if !strings.Contains(raw, c.code) {
+			t.Fatalf("%s: 错误码应为 %s，body=%s", c.name, c.code, raw)
+		}
+		if w.Header().Get("Retry-After") == "" {
+			t.Fatalf("%s: 缺 Retry-After", c.name)
+		}
 	}
 }

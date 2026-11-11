@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/media"
+	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 	"github.com/linguo2625469/minimaxcode2api/internal/reqlog"
 )
 
@@ -98,6 +99,19 @@ func (s *Server) callMedia(ctx context.Context, tool string, payload any) ([]byt
 
 // writeMediaError 把上游错误映射成对外的 OpenAI 风格错误。
 func writeMediaError(w http.ResponseWriter, err error) {
+	// 池的两种容量错误都要对齐文本链路，否则客户端会把冷却当成 5xx 重试风暴：
+	//   池里没账号（全删/全禁用）→ 503 no_account
+	//   账号全在冷却或在途满   → 429 all_accounts_busy
+	if errors.Is(err, pool.ErrNoAccount) {
+		w.Header().Set("Retry-After", "5")
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_account", err.Error())
+		return
+	}
+	if errors.Is(err, pool.ErrAllBusy) {
+		w.Header().Set("Retry-After", "5")
+		writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_busy", err.Error())
+		return
+	}
 	status := media.StatusOf(err)
 	code := "upstream_error"
 	var me *media.Error
