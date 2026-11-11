@@ -1,0 +1,22 @@
+services:
+  minimaxcode2api:
+    build: .
+    image: minimaxcode2api:latest
+    container_name: minimaxcode2api
+    restart: unless-stopped
+    # 只绑回环，默认不对外暴露；要让别的机器用，改成 "7864:7864" 并自己加反代/鉴权。
+    ports:
+      - "127.0.0.1:7864:7864"
+    environment:
+      # 留空则首次启动自动生成并写进 data/config.json
+      MMX2A_API_KEY: ${MMX2A_API_KEY:-}
+      MMX2A_ADMIN_PASSWORD: ${MMX2A_ADMIN_PASSWORD:-}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7864/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
