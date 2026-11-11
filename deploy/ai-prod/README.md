@@ -6,7 +6,7 @@
 |---|---|
 | 机器 | `210.121.44.245`（首尔 AS9848），root + `~/.ssh/id_ed25519_ops` |
 | 服务目录 | `/opt/minimaxcode2api/`（`src/` 源码、`data/` 运行时、`nginx/` 脚本与片段） |
-| 容器 | `minimaxcode2api:0.2.0`，`restart: unless-stopped`，非 root（uid 10001） |
+| 容器 | `minimaxcode2api:0.2.1`，`restart: unless-stopped`，非 root（uid 10001） |
 | 监听 | **仅回环** `127.0.0.1:39350` → 容器 `7864` |
 | 入口 | 宝塔 nginx：`:80` 一律 301 → `:443` 反代回环 |
 | 证书 | `/www/server/panel/vhost/cert/minimaxcode.1task.cn/`（acme.sh，到期 2027-02-09，自动续期） |
@@ -103,7 +103,7 @@ scp ... ; ssh ... 'tar -xzf ... && cd /opt/minimaxcode2api/src && docker build -
 | 检查 | 结果 |
 |---|---|
 | `:80` → `:443` | 301 |
-| `https://minimaxcode.1task.cn/healthz` | 200 `{"ok":true,…,"version":"0.2.0"}` |
+| `https://minimaxcode.1task.cn/healthz` | 200 `{"ok":true,…,"version":"0.2.1"}` |
 | `/panel/`（SNI） | 200 |
 | `/v1/models` 无 key | 401 |
 | `/v1/models` 带 key | 200 `['MiniMax-M3.1-Flash','MiniMax-M3']` |
@@ -112,3 +112,25 @@ scp ... ; ssh ... 'tar -xzf ... && cd /opt/minimaxcode2api/src && docker build -
 | 账号视图 | 1 个，`mmoat_TL••••••AR4w`，剩余 17 462s |
 | 证书链校验（不加 `-k`） | 200，`ssl_verify=0` |
 | 未登记 Host | 404 |
+
+### 浏览器端到端（2026-11-11 23:40，真机 Chrome）
+
+用 bsk 在线上实点，覆盖登录门 + 五个视图 + 三个运维动作：
+
+| 步骤 | 结果 |
+|---|---|
+| 管理口令登录 | 通过，跳管理台 |
+| 概览 | 账号 1/1、今日请求 1、接入信息与上游地址正确 |
+| 账号 | 异常态红色徽标 + 错误原文、掩码 token、剩余 4.8h、19 次用量 |
+| 模型 | 两个模型与别名映射正确 |
+| 请求日志 | 429 那条可见（IP 112.86.208.244 · curl/8.7.1 · 2.7s） |
+| 设置 | 各分区渲染正常 |
+| 「测试」按钮 | 弹出红色 toast：`失败：upstream 429 …（2056）` |
+| 「清冷却」按钮 | toast「已清除冷却与错误」，状态转绿；随后 `/v1/voices` 立刻 200（327 个） |
+
+**这次 E2E 抓到一个真 bug**：`#toast` 元素带 `hidden` 属性，JS 只改 `className`
+从没移除它 —— 配合样式里的 `[hidden]{display:none!important}`，提示条**永远是隐藏的**。
+表现是面板任何操作（测试/保存/删除）都没有反馈，只能靠列表重载去猜结果。
+已在 0.2.1 修复（`t.hidden=false` + `.toast{pointer-events:none}` 防挡按钮）。
+同时把「恢复」改名「清冷却」—— 它清的是冷却与错误，不是启用账号，紧挨着「停用」
+时语义容易误解。
