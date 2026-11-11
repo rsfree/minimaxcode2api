@@ -192,7 +192,6 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | 路由 | 说明 | 状态 |
 |---|---|---|
 | `POST /v1/images/generations` | OpenAI 图像协议（canonical），见下节 | ✅ 真调 + schema 全验 |
-| `POST /v1/images/edits` | multipart 前门，折叠成同一份 canonical | ✅ 端到端验过 |
 | 视频四个端点 | 异步视频协议（canonical），见下节 | ✅ 提交/查询/列表/删除全验 |
 | `POST /v1/audio/speech` | 文本转语音，直接回音频字节 | ✅ 真调通过 |
 | `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
@@ -257,13 +256,11 @@ need to top up"，但控制台实际显示的是：
 
 ## 图片接口（OpenAI 图像协议）
 
-规范入口是 `generations`（JSON），`edits` 只是 **multipart 载体前门** —— 两者折叠成
-同一份 canonical 再打上游。
+只有一个入口：`POST /v1/images/generations`（JSON）。图片引用用字符串
+（URL / data URI / 裸 base64），`image` 支持 `string` / `string[]` / `null`。
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/v1/images/generations` | JSON；`image` 支持 `string` / `string[]` / `null` |
-| `POST` | `/v1/images/edits` | multipart；图片必须是**文件 part**（文本引用一律 400） |
+> 刻意不做 `/v1/images/edits`：那是 multipart 载体前门，收文件就要替客户端托管字节、
+> 还多一套"哪些字段能传"的歧义。i2i 直接用 `generations` 传 `image` 即可。
 
 ### 请求与归一化
 
@@ -308,8 +305,8 @@ need to top up"，但控制台实际显示的是：
 
 ### 验证
 
-- **14 项端到端**：真网关二进制 + 假上游 + 官方 `image-protocol.schema.json` 机器校验，
-  覆盖文生图 / 批量 / b64 / image 数组 / image 单串 / edits 文件 / 六类拒绝 —— 全绿；
+- **12 项端到端**：真网关二进制 + 假上游 + 官方 `image-protocol.schema.json` 机器校验，
+  覆盖文生图 / 批量 / b64 / image 数组 / image 单串 / 五类拒绝 —— 全绿；
 - Go 侧 9 个用例：`n` 归一化（含 `2` vs `2.0`）、`image` 三写法、`mask` 无图、
   `size→档位`、extras 透传、data URI 按 magic bytes 判 mime。
 
