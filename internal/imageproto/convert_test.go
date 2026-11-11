@@ -1,7 +1,6 @@
 package imageproto
 
 import (
-	"encoding/json"
 	"testing"
 )
 
@@ -164,15 +163,4 @@ func TestExtrasPassthrough(t *testing.T) {
 	if _, ok := payload["nested"].(map[string]any); !ok {
 		t.Fatalf("嵌套 extras 未透传: %v", payload["nested"])
 	}
-}
-
-// DataURIFromBytes 按 magic bytes 判 mime，不信声明。
-func TestDataURIFromBytes(t *testing.T) {
-	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0}
-	got := DataURIFromBytes(jpeg, "image/png")
-	if got[:15] != "data:image/jpeg" {
-		t.Fatalf("mime 应按字节判成 jpeg，实际 %s", got[:20])
-	}
-	var probe map[string]any
-	_ = json.Unmarshal([]byte(`{}`), &probe) // 保证 json 包被使用（编译期）
 }

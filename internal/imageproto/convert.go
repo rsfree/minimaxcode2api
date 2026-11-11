@@ -16,7 +16,6 @@ package imageproto
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -349,28 +348,4 @@ func parseWH(size string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return w, h, true
-}
-
-// DataURIFromBytes 把上传的文件包成 data URI（edits 入口用）。
-// mime 按 magic bytes 判，不信客户端声明的 Content-Type。
-func DataURIFromBytes(b []byte, declared string) string {
-	return "data:" + SniffImageMime(b, declared) + ";base64," + base64.StdEncoding.EncodeToString(b)
-}
-
-// SniffImageMime 只认图片，识别不出时用声明值兜底。
-func SniffImageMime(b []byte, declared string) string {
-	switch {
-	case len(b) >= 8 && string(b[:8]) == "\x89PNG\r\n\x1a\n":
-		return "image/png"
-	case len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF:
-		return "image/jpeg"
-	case len(b) >= 6 && (string(b[:6]) == "GIF87a" || string(b[:6]) == "GIF89a"):
-		return "image/gif"
-	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP":
-		return "image/webp"
-	}
-	if strings.HasPrefix(declared, "image/") {
-		return strings.ToLower(declared)
-	}
-	return "image/png"
 }

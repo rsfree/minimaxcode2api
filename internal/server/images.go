@@ -6,8 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,12 +15,11 @@ import (
 
 // 图片接口按 OpenAI 图像协议的 canonical 契约实现：
 //
-//	POST /v1/images/generations   JSON（唯一的规范入口）
-//	POST /v1/images/edits         multipart（载体前门，折叠成同一份 canonical）
+//	POST /v1/images/generations
 //
-// 两个前门只决定「怎么读请求」，中间只有一份 canonical → 上游的翻译。
-// 回包与错误形状共用 runImageGeneration，避免两条路径对同一份上游响应
-// 给出不同解释。
+// 只保留这一个入口：canonical 就是 JSON，图片引用用字符串（URL / data URI /
+// 裸 base64），不引 multipart —— 少一个载体前门就少一套「哪些字段能传」的歧义，
+// 也不用替客户端去公网取图。
 
 const maxImageBody = 64 << 20
 
@@ -70,132 +67,6 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logMedia(r, "", perr.Status, start, errors.New(perr.Message))
 	writeImageError(w, perr)
-}
-
-// handleImageEdits multipart 入口：图片必须是文件 part。
-//
-// 文本引用（image=https://…）在这里是**非法载体**，直接 400 —— 收下就等于让
-// 网关替客户端去公网取图，多开一个 SSRF 面。
-func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	req, perr := decodeEdits(r)
-	if perr == nil {
-		var payload map[string]any
-		var warnings []string
-		payload, warnings, perr = req.Build()
-		if perr == nil {
-			s.runImageGeneration(w, r, req, payload, warnings, start)
-			return
-		}
-	}
-	s.logMedia(r, "", perr.Status, start, errors.New(perr.Message))
-	writeImageError(w, perr)
-}
-
-// decodeEdits 把 multipart 折成 canonical。
-func decodeEdits(r *http.Request) (*imageproto.Request, *imageproto.ProtocolError) {
-	ct := strings.ToLower(r.Header.Get("Content-Type"))
-	if !strings.HasPrefix(ct, "multipart/form-data") {
-		return nil, &imageproto.ProtocolError{
-			Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Code: "invalid_request",
-			Message: "/v1/images/edits 只接受 multipart/form-data；" +
-				"图片必须作为文件 part 上传（不要用 JSON 或 URL 引用）",
-		}
-	}
-	if err := r.ParseMultipartForm(maxImageBody); err != nil {
-		return nil, &imageproto.ProtocolError{
-			Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Code: "invalid_form", Message: "解析 multipart 失败: " + err.Error(),
-		}
-	}
-
-	// 文本字段里出现图片引用 => 非法载体。
-	for _, key := range []string{"image", "mask"} {
-		if vals, ok := r.MultipartForm.Value[key]; ok {
-			for _, v := range vals {
-				if strings.TrimSpace(v) != "" {
-					return nil, &imageproto.ProtocolError{
-						Status: http.StatusBadRequest, Type: "invalid_request_error",
-						Param: key, Code: "invalid_request",
-						Message: "edits 入口不接受文本形式的图片引用（URL / data URI / base64），请用文件 part 上传",
-					}
-				}
-			}
-		}
-	}
-
-	// 收集文件 part：image、image[]、image[0..3] 都认。
-	keys := make([]string, 0, len(r.MultipartForm.File))
-	for k := range r.MultipartForm.File {
-		if k == "image" || strings.HasPrefix(k, "image[") {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-
-	refs := make([]string, 0, 4)
-	for _, k := range keys {
-		for _, fh := range r.MultipartForm.File[k] {
-			if fh.Size == 0 {
-				continue // 空 part 按"没传"处理
-			}
-			f, err := fh.Open()
-			if err != nil {
-				return nil, &imageproto.ProtocolError{
-					Status: http.StatusBadRequest, Type: "invalid_request_error",
-					Param: "image", Code: "invalid_form", Message: "读取上传文件失败: " + err.Error(),
-				}
-			}
-			data, rerr := io.ReadAll(io.LimitReader(f, 20<<20))
-			f.Close()
-			if rerr != nil {
-				return nil, &imageproto.ProtocolError{
-					Status: http.StatusBadRequest, Type: "invalid_request_error",
-					Param: "image", Code: "invalid_form", Message: "读取上传文件失败: " + rerr.Error(),
-				}
-			}
-			refs = append(refs, imageproto.DataURIFromBytes(data, fh.Header.Get("Content-Type")))
-		}
-	}
-	if len(refs) == 0 {
-		return nil, &imageproto.ProtocolError{
-			Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Param: "image", Code: "invalid_request",
-			Message: "edits 入口必须带至少一个图片文件 part（字段名 image 或 image[]）",
-		}
-	}
-
-	// mask 文件：canonical 接受但上游不支持，直接点名而不是静默丢掉。
-	if files, ok := r.MultipartForm.File["mask"]; ok && len(files) > 0 {
-		return nil, &imageproto.ProtocolError{
-			Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Param: "mask", Code: "unsupported_parameter",
-			Message: "上游不支持 mask（局部重绘），请去掉 mask 或改用 prompt 描述修改范围",
-		}
-	}
-
-	n := 1
-	if v := strings.TrimSpace(r.FormValue("n")); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 1 {
-			n = parsed
-		}
-	}
-	req := &imageproto.Request{
-		Prompt:  strings.TrimSpace(r.FormValue("prompt")),
-		Image:   refs,
-		N:       n,
-		Model:   strings.TrimSpace(r.FormValue("model")),
-		Size:    strings.TrimSpace(r.FormValue("size")),
-		Quality: strings.TrimSpace(r.FormValue("quality")),
-		Style:   strings.TrimSpace(r.FormValue("style")),
-		User:    strings.TrimSpace(r.FormValue("user")),
-	}
-	switch r.FormValue("response_format") {
-	case "url", "b64_json":
-		req.ResponseFormat = r.FormValue("response_format")
-	}
-	return req, nil
 }
 
 // runImageGeneration 是两条前门共用的执行体。
