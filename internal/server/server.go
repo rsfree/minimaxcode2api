@@ -44,6 +44,9 @@ type Server struct {
 	// 触发轮换，把彼此刷成 invalid_grant。
 	refreshLocks sync.Map
 	usageDirty   chan struct{}
+	// videoTasks 记住 task_id -> model。轮询接口的 model 是必填的，
+	// 但 OpenAI 风格的客户端只会带 task id，所以提交时先存下来。
+	videoTasks sync.Map
 }
 
 // New 组装服务。
@@ -78,6 +81,14 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("POST /v1/messages", s.auth(s.handleMessages))
 	s.Mux.HandleFunc("POST /v1/messages/count_tokens", s.auth(s.handleCountTokens))
 	s.Mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
+	// 媒体接口：上游是 /mavis/api/v1/mcp/*，鉴权与文本一致。
+	s.Mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
+	s.Mux.HandleFunc("POST /v1/videos/generations", s.auth(s.handleVideoCreate))
+	s.Mux.HandleFunc("GET /v1/videos/generations/{id}", s.auth(s.handleVideoGet))
+	s.Mux.HandleFunc("GET /v1/voices", s.auth(s.handleVoices))
+	s.Mux.HandleFunc("POST /v1/audio/speech", s.auth(s.handleSpeech))
+	s.Mux.HandleFunc("POST /v1/audio/transcriptions", s.auth(s.handleTranscriptions))
+	s.Mux.HandleFunc("POST /v1/audio/music", s.auth(s.handleMusic))
 	s.Mux.HandleFunc("GET /v1/models/{id}", s.auth(s.handleModel))
 	s.Mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.Mux.HandleFunc("GET /status", s.auth(s.handleStatus))
