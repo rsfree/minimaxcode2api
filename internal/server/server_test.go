@@ -53,14 +53,15 @@ func newFixture(t *testing.T, up http.HandlerFunc, tokens ...string) *fixture {
 	}))
 	t.Cleanup(upSrv.Close)
 
+	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.APIKey = testKey
 	cfg.Upstream.BaseURL = upSrv.URL
 	cfg.Pool.Strategy = "round_robin"
 	cfg.Logging.RequestArchiveEnabled = false
+	// DataDir 必须隔离：视频任务库按 DataDir 落盘，共用会让用例互相污染。
+	cfg.DataDir = dir
 	holder := config.NewHolder(cfg)
-
-	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "accounts.json"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
