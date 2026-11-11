@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,8 +37,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req convert.ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		entry.Status = http.StatusBadRequest
-		entry.Error = "请求体不是合法 JSON: " + err.Error()
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", entry.Error)
+		// 区分「JSON 语法坏」与「类型不对」：messages 传成字符串时 JSON 本身
+		// 是合法的，报 invalid_json 会让调用方去查转义而不是字段类型。
+		var typeErr *json.UnmarshalTypeError
+		code := "invalid_json"
+		if errors.As(err, &typeErr) {
+			code = "invalid_request"
+		}
+		entry.Error = "请求体解析失败: " + err.Error()
+		writeOpenAIError(w, http.StatusBadRequest, code, entry.Error)
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -89,6 +97,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		entry.Status = status
 		entry.Error = msg
+		if code == "no_account" {
+			w.Header().Set("Retry-After", "5")
+		}
 		writeOpenAIError(w, status, code, msg)
 		return
 	}

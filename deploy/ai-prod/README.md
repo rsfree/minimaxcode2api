@@ -6,7 +6,7 @@
 |---|---|
 | 机器 | `210.121.44.245`（首尔 AS9848），root + `~/.ssh/id_ed25519_ops` |
 | 服务目录 | `/opt/minimaxcode2api/`（`src/` 源码、`data/` 运行时、`nginx/` 脚本与片段） |
-| 容器 | `minimaxcode2api:0.2.1`，`restart: unless-stopped`，非 root（uid 10001） |
+| 容器 | `minimaxcode2api:0.2.3`，`restart: unless-stopped`，非 root（uid 10001） |
 | 监听 | **仅回环** `127.0.0.1:39350` → 容器 `7864` |
 | 入口 | 宝塔 nginx：`:80` 一律 301 → `:443` 反代回环 |
 | 证书 | `/www/server/panel/vhost/cert/minimaxcode.1task.cn/`（acme.sh，到期 2027-02-09，自动续期） |
@@ -103,7 +103,7 @@ scp ... ; ssh ... 'tar -xzf ... && cd /opt/minimaxcode2api/src && docker build -
 | 检查 | 结果 |
 |---|---|
 | `:80` → `:443` | 301 |
-| `https://minimaxcode.1task.cn/healthz` | 200 `{"ok":true,…,"version":"0.2.1"}` |
+| `https://minimaxcode.1task.cn/healthz` | 200 `{"ok":true,…,"version":"0.2.3"}` |
 | `/panel/`（SNI） | 200 |
 | `/v1/models` 无 key | 401 |
 | `/v1/models` 带 key | 200 `['MiniMax-M3.1-Flash','MiniMax-M3']` |
@@ -134,3 +134,40 @@ scp ... ; ssh ... 'tar -xzf ... && cd /opt/minimaxcode2api/src && docker build -
 已在 0.2.1 修复（`t.hidden=false` + `.toast{pointer-events:none}` 防挡按钮）。
 同时把「恢复」改名「清冷却」—— 它清的是冷却与错误，不是启用账号，紧挨着「停用」
 时语义容易误解。
+
+## 全方位测试（2026-11-11 23:55，62 项全绿）
+
+脚本：`/tmp/full_e2e.py`（62 项，分组 A–J），对公网域名跑，不依赖额度。
+
+| 组 | 覆盖 | 结果 |
+|---|---|---|
+| A 入口 | healthz / 版本 / :80→301 / 证书链 / CSP / XFO / nosniff / **HSTS** / 404 / 预检 | 9/9 |
+| B 鉴权 | 无 key / 错 key / Bearer / x-api-key / 面板拒 api_key / /status | 7/7 |
+| C 模型 | 列表 / 两个别名 / 未知模型 404 | 5/5 |
+| D chat | 坏 JSON / 缺 messages / 类型错 / 合法 / 流式 / 工具 | 6/6 |
+| E anthropic | 缺 max_tokens（透传语义）/ count_tokens / 未知模型错误形状 | 3/3 |
+| F 图片 | 五类拒绝 + 合法请求触及上游 | 7/7 |
+| G 视频 | content 缺失 / 场景互斥 / 480p / frames / 列表 / 404 / /api/v3 / 同步门 | 9/9 |
+| H 音频 | speech 缺参 / music 过短 / 转写载体 / 音色 | 4/4 |
+| I 面板 | 错口令 / 对口令 / 六个只读接口 / 导入空体 / 路径穿越 | 10/10 |
+| J 并发 | 20 并发 /v1/models 全 200；10 并发 chat 无 5xx | 2/2 |
+
+另外：`go test ./... -race` 干净；图片成功路径 12/12（假上游）；50 并发 chat 2.3s 内全部
+返回（429，零 5xx、零超时）；`docker restart` 后账号文件 md5 不变、健康检查恢复。
+
+### 这一轮修掉的四个真问题
+
+1. **`/v1/models/{alias}` 返回 404** —— 详情接口只比原始 id，认不了 `M3` / `m3.1-flash`。
+   客户端拿别名探测就会以为模型不存在。已改为走 `resolveModel`。
+2. **媒体链路的容量错误口径与文本链路不一致** —— 池空/全冷却在媒体接口报
+   `502 upstream_error`，而文本链路报 `503 no_account` / `429 all_accounts_busy`。
+   客户端会把"冷却"当上游故障重试，形成重试风暴。现在两条链路同口径，且都带
+   `Retry-After: 5`。
+3. **缺 HSTS** —— 公开 HTTPS 端点没有 `Strict-Transport-Security`，已加
+   `max-age=31536000`（不带 includeSubDomains，避免波及 1task.cn 其他子域）。
+4. **字段类型错被归成 `invalid_json`** —— `{"messages":"hi"}` 的 JSON 语法本身合法，
+   报 invalid_json 会让调用方去查转义。现在用 `json.UnmarshalTypeError` 区分：
+   语法坏 → `invalid_json`，类型错 → `invalid_request`。
+
+> 顺带纠正我自己写错的两条断言：`/status` 传了合法 key 当然是 200（鉴权是对的）；
+> `480p` 报 `unsupported_parameter` 比 `invalid_request` 更准确（是取值域不支持）。

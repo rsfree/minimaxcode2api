@@ -28,7 +28,7 @@ import (
 )
 
 // Version 网关版本。
-const Version = "0.2.1"
+const Version = "0.2.3"
 
 // Server 网关主对象。
 type Server struct {
@@ -307,7 +307,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	// 别名也要能查：/v1/models/M3 与 /v1/models/MiniMax-M3 必须等价，
+	// 否则客户端拿 /v1/models 里的 id 之外的名字探测就会 404。
+	id := s.resolveModel(r.PathValue("id"))
 	for _, m := range s.modelList() {
 		if m.ID == id {
 			writeJSON(w, http.StatusOK, m)

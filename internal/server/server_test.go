@@ -478,3 +478,95 @@ func TestUnknownRouteJSON404(t *testing.T) {
 		t.Fatalf("/healthz = %d，被兜底 handler 吃掉了", h.StatusCode)
 	}
 }
+
+// 模型详情要认别名：/v1/models/M3 与 /v1/models/MiniMax-M3 等价。
+// 之前只比原始 id，客户端拿别名探测会 404。
+func TestModelAliasLookup(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("模型查询不该打到上游")
+	}, "tok1")
+
+	for _, alias := range []string{"M3", "minimax-m3", "MiniMax-M3"} {
+		resp, raw := f.get(t, "/v1/models/"+alias)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: 状态码 = %d，body=%s", alias, resp.StatusCode, raw)
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil || out.ID != "MiniMax-M3" {
+			t.Fatalf("%s: id = %q err=%v", alias, out.ID, err)
+		}
+	}
+	// 真不存在的仍要 404。
+	if resp, _ := f.get(t, "/v1/models/gpt-4o"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("未知模型 = %d，期望 404", resp.StatusCode)
+	}
+}
+
+// 池里没有可用账号是「容量」问题：503 + no_account + Retry-After，
+// 不能报成 502 upstream_error（客户端会当成上游故障重试）。
+func TestNoAccountIs503WithRetryAfter(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("无账号时不该打到上游")
+	})
+
+	resp, raw := f.post(t, "/v1/chat/completions",
+		`{"model":"M3","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("chat 状态码 = %d，期望 503，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "no_account") {
+		t.Fatalf("chat 错误码应为 no_account: %s", raw)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("chat 缺 Retry-After")
+	}
+
+	// 媒体链路必须与文本链路同一口径。
+	resp2, raw2 := f.post(t, "/v1/audio/music",
+		`{"prompt":"轻松的钢琴背景音乐，适合午后阅读"}`)
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("media 状态码 = %d，期望 503，body=%s", resp2.StatusCode, raw2)
+	}
+	if !strings.Contains(string(raw2), "no_account") {
+		t.Fatalf("media 错误码应为 no_account: %s", raw2)
+	}
+	if resp2.Header.Get("Retry-After") == "" {
+		t.Fatalf("media 缺 Retry-After")
+	}
+}
+
+// 坏 JSON 归因成 invalid_json（与图像/视频一致），不是笼统的 invalid_request。
+func TestBadJSONIsInvalidJSON(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("坏 JSON 不该打到上游")
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/chat/completions", `{"model":`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400", resp.StatusCode)
+	}
+	if !strings.Contains(string(raw), "invalid_json") {
+		t.Fatalf("应回 invalid_json: %s", raw)
+	}
+}
+
+// messages 传成字符串时 JSON 语法本身是合法的 —— 归因应为 invalid_request
+// （字段类型错），不是 invalid_json（让人去查转义）。
+func TestWrongFieldTypeIsInvalidRequest(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("类型错的请求不该打到上游")
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/chat/completions", `{"model":"M3","messages":"hi"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "invalid_request") {
+		t.Fatalf("应回 invalid_request: %s", raw)
+	}
+	if strings.Contains(string(raw), "invalid_json") {
+		t.Fatalf("类型错误不该报 invalid_json: %s", raw)
+	}
+}
