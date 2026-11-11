@@ -434,3 +434,47 @@ func TestMessagesPassthrough(t *testing.T) {
 		t.Fatalf("type = %v，期望 message", out["type"])
 	}
 }
+
+// 未知路径必须回 JSON 404：曾经因为 "OPTIONS /" 是唯一能匹配 /v1/nope 的 pattern，
+// Go 的 ServeMux 判成 method 不匹配，回了纯文本 405（客户端会以为路径存在但方法错了）。
+func TestUnknownRouteJSON404(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("未知路径不该打到上游: %s", r.URL.Path)
+	}, "tok1")
+
+	call := func(method, path string) (*http.Response, []byte) {
+		req, err := http.NewRequest(method, f.front.URL+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp, raw
+	}
+
+	resp, raw := call(http.MethodGet, "/v1/nope")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("状态码 = %d，期望 404，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "unknown_route") {
+		t.Fatalf("应回 unknown_route 信封，body=%s", raw)
+	}
+
+	// 浏览器预检：必须 204 且放行 DELETE（视频 DELETE 端点依赖它）。
+	opt, _ := call(http.MethodOptions, "/v1/contents/generations/tasks/x")
+	if opt.StatusCode != http.StatusNoContent {
+		t.Fatalf("OPTIONS 状态码 = %d，期望 204", opt.StatusCode)
+	}
+	if got := opt.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, "DELETE") {
+		t.Fatalf("Allow-Methods = %q，缺 DELETE", got)
+	}
+
+	// 兜底的 "/" 不能吃掉更具体的路由。
+	if h, _ := call(http.MethodGet, "/healthz"); h.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz = %d，被兜底 handler 吃掉了", h.StatusCode)
+	}
+}
