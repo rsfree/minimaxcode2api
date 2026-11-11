@@ -115,6 +115,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 
 模型别名：`M3` / `minimax-m3` → `MiniMax-M3`，`M3.1-Flash` / `MiniMax-M3.1` / `m3.1-flash` → `MiniMax-M3.1-Flash`。
 
+图片、视频、语音的路由见《[媒体接口](#媒体接口图片--视频--语音)》。
+
 ### 思考（thinking）怎么处理的
 
 这是唯一需要"猜"的地方，规则写在 `internal/convert/decideThinking`：
@@ -178,31 +180,69 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 
 界面无框架、无外部字体/CDN，`script-src 'self'` 严格 CSP，所有文本走 `textContent`。
 
-## 媒体能力（端点已摸清，本版未代理）
+## 媒体接口（图片 / 视频 / 语音）
 
-文本走 `/mavis/api/v1/llm/v1/messages`，图片/视频/语音走的是**另一个网关**
-`/mavis/api/v1/mcp/<tool>` —— 桌面端在 `DesktopMatrixClient` 里把
+文本走 `/mavis/api/v1/llm/v1/messages`；媒体走**另一个网关**
+`/mavis/api/v1/mcp/<tool>`。桌面端在 `DesktopMatrixClient` 里把
 `/matrix/api/v1/mcp/*` 重写成 `/mavis/api/v1/mcp/*` 再发。鉴权同样只要
-`Authorization: Bearer`，**不需要 `x-signature`**（签名只用于少数旧接口）。
+`Authorization: Bearer`，**不需要 `x-signature`**。
 
-全量 17 个工具（来自 `@mavis/agent-tools/.../matrix-tools/tool-defs.js`）：
+已实现的路由（都真调过上游）：
 
-| 端点 | 用途 | 验证程度 |
+| 路由 | 说明 | 状态 |
 |---|---|---|
-| `image_synthesize` | 文生图 / 图生图，`requests[]` 需 `prompt` + `output_file`，可带 `input_urls` / `aspect_ratio` / `resolution` | 鉴权通过（空参数被正确判 400） |
-| `submit_video_generation` / `query_video_generation` | 提交 + 轮询视频任务 | 200，缺 `task_id` 时返回明确提示 |
-| `gen_videos` / `batch_text_to_video` / `batch_image_to_video` | 视频批量生成 | 未实测 |
-| `get_voice_list` | 音色列表 | ✅ 返回真实音色表 |
-| `synthesize_speech` / `batch_synthesize_speech` / `batch_text_to_audio` / `batch_text_to_music` | 语音合成 / 音乐 | 未实测 |
-| `transcribe_audio`（路径 `listen_audio`）/ `audios_understand` | 转写 / 音频理解 | 未实测 |
-| `images_understand` / `videos_understand` | 图片 / 视频理解 | 未实测 |
-| `web_search` / `images_search_and_download` / `image_reverse_search` | 搜索类 | 未实测 |
+| `POST /v1/images/generations` | OpenAI 图片接口，支持 `n` / `size` / `quality` / `response_format=url\|b64_json` / 参考图 `image` | ✅ 真调通过 |
+| `POST /v1/videos/generations` | 提交异步视频任务，支持 `model` / `duration` / `resolution` / `ratio` / `image_url`（首帧） | ✅ 提交通过（额度受限，见下） |
+| `GET /v1/videos/generations/{id}` | 轮询任务，`?model=` 可省（提交时已记住） | ✅ 状态机通过 |
+| `POST /v1/audio/speech` | 文本转语音，直接回音频字节 | ✅ 真调通过 |
+| `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
+| `POST /v1/audio/music` | 音乐生成，默认回字节，`response_format=url` 回链接 | ✅ 真调通过 |
+| `GET /v1/voices` | 音色列表（实测 327 个） | ✅ 真调通过 |
 
-画布另有 `remove_image_background`、`enhance_image` 两个图像处理端点。
+### 上游的五个坑（都是实测踩出来的）
 
-> **注意**：本节列的是"上游能不能调通"，不是"网关已经支持"。当前版本对外只暴露
-> 文本接口；要接媒体，新增 `/v1/images/generations`、`/v1/video/generations`
-> 之类的路由即可，凭据复用同一个账号池。
+1. **业务错误永远 HTTP 200**，真正的码在 body 的 `code` 里：`0` 成功、`400` 参数、
+   `402` 计费、`401` 凭据。只看状态码会把"余额不足"当成成功。
+2. **`code=503` 不是失败，是"稍后再查"**。视频会返回
+   `status=succeeded` + `code=503` + "已就绪但还没准备好下发，查同一个 task_id，
+   别重新提交"。网关此时对外报 `status=running` 并带上 `upstream_status`，
+   否则客户端会立刻取 url 落空、把已完成任务判成失败。这类响应**绝不换号重试**。
+3. **产物 Content-Type 会撒谎**。实测 JPEG 被标成 `image/png`、文件名还是 `.png`。
+   网关一律按 magic bytes 嗅探（`internal/server/media.go: sniffMime`），
+   `b64_json` 与音频字节都走同一套判断。
+4. **`resolution` 是三档档位不是像素**：`1K/2K/4K`，实际输出由上游按比例决定
+   （实测 1K+1:1=1024²，1K+16:9=1408×768，2K+16:9=2752×1536）。
+5. **`image_synthesize` 是槽位制**：`requests[]` 每项必须给 `output_file`
+   （槽位名），返回按槽位名对应回来，成功/失败是两个分开的数组。
+
+### 计费与额度（重要）
+
+同一个账号下，不同模型的扣费来源不一样，实测差异很大：
+
+| 能力 | 结果 |
+|---|---|
+| 图片生成 / TTS / ASR / 音乐 | 正常出结果（成本低，走套餐额度） |
+| `MiniMax-Hailuo-2.3` 视频 | 提交需 **280 credits**，额度不足时 `402` |
+| `MiniMax-H3` 视频 | 提交需 **416 credits**，且只走 M Plan 周额度 |
+
+测试期间账号余额波动过：同一批接口先返回 `402 plan balance has run out`，
+几十分钟后又恢复正常。所以**看到 402 先查余额，不要当成接口坏了**。
+网关对 402 的映射是 `HTTP 402 + code=insufficient_quota`，且**不重试、不换号**
+（换号也一样扣不到钱，重试只会放大失败）。
+
+### 实测耗时（供超时配置参考）
+
+| 操作 | 耗时 |
+|---|---|
+| 1 张 1K 图 | ≈15s |
+| 1 张 2K 图 | ≈42s |
+| 批量 2 张 1K | ≈109s |
+| 音乐 1 首 | ≈25s |
+| TTS 一句 | <1s |
+| 视频 Hailuo 6s（提交→succeeded） | ≈235s（queued 167s 后转 running） |
+| 视频下发准备 | 本次因额度不足一直 `503`，未拿到最终 mp4 |
+
+默认 `upstream.timeout_seconds=600`，跑批量图与视频轮询够用；要跑 4K 多图建议调到 900。
 
 ## 国内版 / 国际版
 
@@ -224,7 +264,9 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 ## 边界（明确不做）
 
 - 不做 `/v1/responses`、embeddings、rerank；
-- **这一版只代理文本**：图片/视频/语音的端点在另一个网关（见下节），已摸清但未接进来；
+- 不做「视觉理解 / 联网搜索」的独立路由：视觉走 `/v1/chat/completions` 的图片输入即可
+  （上游 `images_understand`、`web_search` 这些工具能调通，但属于 agent 内部工具，没做成对外 API）；
+- 视频只做「提交 + 轮询」，不做回调（上游不支持 callback_url）；
 - 不做计费与配额，用量只统计不扣费；
 - 不做多用户/RBAC，面板是单人运维工具；
 - 请求日志只在内存环形缓冲里，重启即清空（长期审计请接外部日志）；
@@ -238,9 +280,11 @@ internal/config/     配置加载/默认值/热更新 Holder
 internal/store/      账号持久化（原子写，0600）
 internal/oauth/      设备授权（PKCE）、刷新、撤销
 internal/upstream/   上游客户端（Anthropic Messages）
+internal/media/      媒体网关客户端（/mavis/api/v1/mcp/*，业务码在 body 里）
 internal/convert/    OpenAI ⇄ Anthropic 协议转换（请求/响应/流式）
 internal/pool/       账号池调度、冷却、熔断
 internal/server/     HTTP 路由、SSE、重试与换号
+                     └ images.go / videos.go / audio.go：媒体路由与产物下载
 internal/panel/      管理台 API + 内嵌 UI（go:embed）
 internal/usage/      按天/模型/账号用量聚合
 internal/reqlog/     请求日志环形缓冲
@@ -254,7 +298,12 @@ go test ./... -count=1
 
 覆盖的是易回归的点：坏 token 换号、400 不换号、全 401、流式工具调用拼装、
 `[hidden]`/信封字段清理、forced_adaptive 绝不传 `thinking`、小 `max_tokens` 下的思考预算、
-首次启动的环境变量注入。
+首次启动的环境变量注入、地域切换、以及媒体层的四类边界：
+
+- 402 计费错误**只打一次上游**（不重试、不换号）且映射成 `insufficient_quota`；
+- `code=503 + status=succeeded` 的视频轮询对外报 `running`，不能当终态；
+- `b64_json` 按 magic bytes 判类型（假上游故意把 JPEG 标成 `image/png`）；
+- multipart 转写要把文件转成 base64 内联，且 `mime_type` 按嗅探结果填。
 
 ## 声明
 

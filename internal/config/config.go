@@ -55,6 +55,9 @@ func (d Duration) Std() time.Duration { return time.Duration(d) }
 type Upstream struct {
 	// BaseURL 到 /v1 为止，代码里再拼 /messages。
 	BaseURL string `json:"base_url"`
+	// MediaBaseURL 媒体网关（到 mcp 为止）。留空则由 BaseURL 推导：
+	// .../llm/v1 -> .../mcp，所以切 region 时媒体域名自动跟着走。
+	MediaBaseURL string `json:"media_base_url"`
 	// AnthropicVersion 上游要求的协议版本头。
 	AnthropicVersion string `json:"anthropic_version"`
 	// UserAgent 对齐官方客户端指纹；留空则用内置默认值。
