@@ -454,26 +454,17 @@ func writeProtoError(w http.ResponseWriter, perr *videoproto.ProtocolError) {
 	if status == 0 {
 		status = http.StatusBadRequest
 	}
-	var param any
-	if perr.Param != "" {
-		param = perr.Param
-	}
-	var code any
-	if perr.Code != "" {
-		code = perr.Code
-	}
 	typ := perr.Type
 	if typ == "" {
-		typ = "invalid_request_error"
+		// 视频协议的错误 type 只有 invalid_request_error / api_error 两类，
+		// 5xx 不能报成 invalid_request_error（会让客户端去改请求）。
+		if status >= 500 {
+			typ = "api_error"
+		} else {
+			typ = "invalid_request_error"
+		}
 	}
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"message": perr.Message,
-			"type":    typ,
-			"param":   param,
-			"code":    code,
-		},
-	})
+	writeFourKeyError(w, status, typ, perr.Param, perr.Code, perr.Message)
 }
 
 // protoFromMedia 按「谁的错」把媒体网关错误翻成协议错误。

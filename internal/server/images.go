@@ -107,7 +107,7 @@ func (s *Server) runImageGeneration(
 		}
 		s.logMedia(r, req.Model, status, start, errors.New(msg))
 		writeImageError(w, &imageproto.ProtocolError{
-			Status: status, Type: typeForStatus(status), Code: code, Message: msg,
+			Status: status, Type: errorType(status), Code: code, Message: msg,
 		})
 		return
 	}
@@ -159,33 +159,11 @@ func writeImageError(w http.ResponseWriter, perr *imageproto.ProtocolError) {
 	if status == 0 {
 		status = http.StatusBadRequest
 	}
-	var param any
-	if perr.Param != "" {
-		param = perr.Param
-	}
-	var code any
-	if perr.Code != "" {
-		code = perr.Code
-	}
 	typ := perr.Type
 	if typ == "" {
-		typ = typeForStatus(status)
+		typ = errorType(status)
 	}
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"message": perr.Message,
-			"type":    typ,
-			"param":   param,
-			"code":    code,
-		},
-	})
-}
-
-func typeForStatus(status int) string {
-	if status >= 500 || status == http.StatusTooManyRequests || status == http.StatusPaymentRequired {
-		return "api_error"
-	}
-	return "invalid_request_error"
+	writeFourKeyError(w, status, typ, perr.Param, perr.Code, perr.Message)
 }
 
 // imageErrorFromMedia 按「谁的错」翻译上游错误。
