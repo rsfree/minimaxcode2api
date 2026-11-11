@@ -252,23 +252,36 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 
 	ratio, resolution := Shape(r.Size, r.Quality, r.Model)
 	// 上游原生字段优先于 size/quality 推导（显式 > 推导）。
+	//
+	// 这里做「客户端吸附」而不是严格拒绝：上游确实会吸附，但方式不可靠 ——
+	// 实测 `abc`/`8K` 静默回落到 16:9/1K（悄悄改档位等于悄悄改账单），
+	// 而 `2:1`/`7:3` 这类"看着合法"的比例会直接生成失败。所以由我们先吸附成
+	// 合法的六种比例 / 三档，再下发，并把吸附结果回给调用方。
 	if r.AspectRatio != "" {
-		switch r.AspectRatio {
-		case "21:9", "16:9", "4:3", "1:1", "3:4", "9:16":
-			ratio = r.AspectRatio
-		default:
+		snapped, ok := SnapRatio(r.AspectRatio)
+		if !ok {
 			return nil, nil, badRequest("aspect_ratio", "invalid_request",
-				"aspect_ratio 只接受 21:9/16:9/4:3/1:1/3:4/9:16，收到 %q", r.AspectRatio)
+				"aspect_ratio 无法解析：%q（请写成 W:H，如 16:9）", r.AspectRatio)
 		}
+		if snapped != r.AspectRatio {
+			warnings = append(warnings, fmt.Sprintf(
+				"aspect_ratio %q 已吸附为 %s（上游只输出六种比例，像素按 16 栅格对齐）",
+				r.AspectRatio, snapped))
+		}
+		ratio = snapped
 	}
 	if r.Resolution != "" {
-		switch strings.ToUpper(r.Resolution) {
-		case "1K", "2K", "4K":
-			resolution = strings.ToUpper(r.Resolution)
-		default:
+		snapped, ok := SnapResolution(r.Resolution)
+		if !ok {
 			return nil, nil, badRequest("resolution", "invalid_request",
-				"resolution 只接受 1K/2K/4K，收到 %q", r.Resolution)
+				"resolution 无法解析：%q（请用 1K/2K/4K，或 720p/1080p/1440p/2160p 这类写法）",
+				r.Resolution)
 		}
+		if strings.ToUpper(r.Resolution) != snapped {
+			warnings = append(warnings, fmt.Sprintf(
+				"resolution %q 已吸附为 %s（上游只有 1K/2K/4K 三档）", r.Resolution, snapped))
+		}
+		resolution = snapped
 	}
 	items := make([]map[string]any, 0, n)
 	for i := 0; i < n; i++ {
@@ -317,6 +330,99 @@ func Shape(size, quality, model string) (ratio, resolution string) {
 		resolution = resolutionFromSize(size)
 	}
 	return ratio, resolution
+}
+
+// sixRatios 是上游实际输出的六种比例（像素按 16 栅格对齐，比例本身是吸附值）。
+var sixRatios = []struct {
+	label string
+	value float64
+}{
+	{"21:9", 21.0 / 9.0}, {"16:9", 16.0 / 9.0}, {"4:3", 4.0 / 3.0},
+	{"1:1", 1}, {"3:4", 3.0 / 4.0}, {"9:16", 9.0 / 16.0},
+}
+
+// SnapRatio 把任意 "W:H"（也接受 "W/H"）吸附到最接近的合法比例。
+//
+// 用对数距离而不是差值：2:1 与 16:9 的差是 0.22，与 21:9 的差是 0.33，
+// 但按比例尺它们分别差 11% 与 14%，人眼与模型都更接近 16:9。
+func SnapRatio(v string) (string, bool) {
+	s := strings.TrimSpace(v)
+	s = strings.ReplaceAll(s, "/", ":")
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	w, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	h, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return "", false
+	}
+	target := math.Log(w / h)
+	best, bestDiff := "1:1", math.MaxFloat64
+	for _, r := range sixRatios {
+		if d := math.Abs(math.Log(r.value) - target); d < bestDiff {
+			best, bestDiff = r.label, d
+		}
+	}
+	return best, true
+}
+
+// SnapResolution 把常见写法吸附到 1K/2K/4K 三档。
+//
+// 按「最长边像素」判：<1200 → 1K（1K 的 16:9 实测就是 1376×768），
+// <2000 → 2K，其余 → 4K。所以 720p/1080p 落 1K、1440p 落 2K、2160p/8K 落 4K。
+//
+// 注意 `8K` 是 8000 级别而不是数字 8：带 k/K 后缀要乘 1024，否则会被误判成 1K。
+func SnapResolution(v string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return "", false
+	}
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return "", false
+	}
+	num, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil || num <= 0 {
+		return "", false
+	}
+	// 三种写法语义不同，必须分开判：
+	//   `4k`  → 长边 ≈ 4096（乘 1024）
+	//   `1080p` → 1080 是高度，1K 档的 16:9 实测 1376×768，所以 1080p 落 1K
+	//   裸数字 → 当长边像素看
+	switch suffix := s[i:]; {
+	case strings.HasPrefix(suffix, "k"):
+		px := num * 1024
+		switch {
+		case px < 1600:
+			return "1K", true
+		case px < 3200:
+			return "2K", true
+		default:
+			return "4K", true
+		}
+	case strings.HasPrefix(suffix, "p"):
+		switch {
+		case num <= 1200:
+			return "1K", true
+		case num <= 1800:
+			return "2K", true
+		default:
+			return "4K", true
+		}
+	default:
+		switch {
+		case num < 1600:
+			return "1K", true
+		case num < 3200:
+			return "2K", true
+		default:
+			return "4K", true
+		}
+	}
 }
 
 // resolutionFromSize 按最长边选档位。阈值来自实测输出：
