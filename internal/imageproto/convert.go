@@ -33,9 +33,14 @@ type Request struct {
 	Model          string
 	Size           string
 	Quality        string
-	Style          string
-	User           string
-	Extras         map[string]any
+	// AspectRatio / Resolution 是 MiniMax 上游的原生档位（1K/2K/4K + 六种比例），
+	// 不属于 OpenAI 协议。它们必须显式进 items —— 当成 vendor extra 透传到顶层
+	// 会被上游忽略，表现为"请求了 21:9 却回 1:1"。
+	AspectRatio string
+	Resolution  string
+	Style       string
+	User        string
+	Extras      map[string]any
 }
 
 // ProtocolError 是四键错误信封的语义。
@@ -63,6 +68,7 @@ var knownKeys = map[string]bool{
 	"prompt": true, "image": true, "mask": true, "n": true,
 	"response_format": true, "model": true, "size": true,
 	"quality": true, "style": true, "user": true,
+	"aspect_ratio": true, "resolution": true,
 }
 
 // Decode 解析请求体并按协议顺序归一化。
@@ -141,6 +147,7 @@ func Decode(raw []byte) (*Request, *ProtocolError) {
 	for key, dst := range map[string]*string{
 		"model": &req.Model, "size": &req.Size, "quality": &req.Quality,
 		"style": &req.Style, "user": &req.User,
+		"aspect_ratio": &req.AspectRatio, "resolution": &req.Resolution,
 	} {
 		if v, ok := obj[key]; ok {
 			if s, isStr := v.(string); isStr {
@@ -244,6 +251,25 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 	}
 
 	ratio, resolution := Shape(r.Size, r.Quality, r.Model)
+	// 上游原生字段优先于 size/quality 推导（显式 > 推导）。
+	if r.AspectRatio != "" {
+		switch r.AspectRatio {
+		case "21:9", "16:9", "4:3", "1:1", "3:4", "9:16":
+			ratio = r.AspectRatio
+		default:
+			return nil, nil, badRequest("aspect_ratio", "invalid_request",
+				"aspect_ratio 只接受 21:9/16:9/4:3/1:1/3:4/9:16，收到 %q", r.AspectRatio)
+		}
+	}
+	if r.Resolution != "" {
+		switch strings.ToUpper(r.Resolution) {
+		case "1K", "2K", "4K":
+			resolution = strings.ToUpper(r.Resolution)
+		default:
+			return nil, nil, badRequest("resolution", "invalid_request",
+				"resolution 只接受 1K/2K/4K，收到 %q", r.Resolution)
+		}
+	}
 	items := make([]map[string]any, 0, n)
 	for i := 0; i < n; i++ {
 		item := map[string]any{
