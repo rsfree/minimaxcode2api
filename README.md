@@ -49,7 +49,10 @@ minimaxcode2api 0.1.0 启动中
   提示      : 还没有账号，打开管理台用「设备授权」添加
 ```
 
-打开管理台，用 `api_key` 登录 → **添加账号 → 设备授权** → 浏览器里点「授权」，账号自动入池。
+打开管理台，用**面板口令**登录 → **添加账号 → 设备授权** → 浏览器里点「授权」，账号自动入池。
+
+> 口令取值有顺序：设了 `admin_password`（或 `MMX2A_ADMIN_PASSWORD`）就用它；
+> 留空才回落到 `api_key`。生产环境建议分开设——面板口令泄露不该等于 API Key 泄露。
 
 ### Docker
 
@@ -536,3 +539,13 @@ go test ./... -count=1
 
 仅用于个人学习与自用接入，非官方项目。使用前请自行确认符合 MiniMax 服务条款；
 账号风控、封禁等后果由使用者承担。
+
+## 部署
+
+生产实例跑在 **ai-prod**：`https://minimaxcode.1task.cn`（容器只绑回环 `127.0.0.1:39350`，
+公网入口由宝塔 nginx 终结 TLS）。部署与运维细节见
+[`deploy/ai-prod/README.md`](deploy/ai-prod/README.md)，目录里含：
+
+- `docker-compose.yml` —— 生产 compose（环境变量走同目录 `.env`，不入库）
+- `nginx/minimaxcode.1task.cn.conf` / `-ssl.conf` / `minimaxcode-proxy.inc` —— :80 跳转 + :443 反代
+- `nginx/apply-https.sh` —— 幂等签发脚本（DNS 预检 → ACME → 投 vhost → 验证矩阵）

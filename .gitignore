@@ -15,3 +15,6 @@ config.json
 
 # 本地记忆/会话数据
 .workbuddy/
+
+# 部署机密（生产密钥，绝不入库）
+deploy/ai-prod/.env
