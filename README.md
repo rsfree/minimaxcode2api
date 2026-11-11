@@ -540,6 +540,17 @@ go test ./... -count=1
 仅用于个人学习与自用接入，非官方项目。使用前请自行确认符合 MiniMax 服务条款；
 账号风控、封禁等后果由使用者承担。
 
+## 验收
+
+```bash
+export MMX_KEY=<对外 API Key>; export MMX_ADMIN=<面板口令>
+python3 scripts/e2e_prod.py     # 62 项，对 https://minimaxcode.1task.cn 跑
+```
+
+断言分两层：校验/路由/鉴权是**严格**的（必须给出确定的状态码与错误码），
+合法请求只要求"打到池或上游"（额度耗尽时回 402/429 也算通过）。这样限额
+打满时仍能守住协议层不回归。
+
 ## 部署
 
 生产实例跑在 **ai-prod**：`https://minimaxcode.1task.cn`（容器只绑回环 `127.0.0.1:39350`，
