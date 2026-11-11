@@ -164,3 +164,39 @@ func TestExtrasPassthrough(t *testing.T) {
 		t.Fatalf("嵌套 extras 未透传: %v", payload["nested"])
 	}
 }
+
+// 上游原生字段必须进 items —— 之前它们掉进 Extras 被透传到顶层，上游直接忽略，
+// 表现为"请求 21:9 却回 1:1"（真实回归）。
+func TestAspectRatioAndResolutionReachItems(t *testing.T) {
+	req, perr := decode(t, `{"prompt":"x","aspect_ratio":"21:9","resolution":"4K"}`)
+	if perr != nil {
+		t.Fatalf("Decode: %+v", perr)
+	}
+	payload, _, perr := req.Build()
+	if perr != nil {
+		t.Fatalf("Build: %+v", perr)
+	}
+	if payload["aspect_ratio"] != nil || payload["resolution"] != nil {
+		t.Fatalf("原生字段不能留在顶层（上游不读）: %v", payload)
+	}
+	item := payload["requests"].([]map[string]any)[0]
+	if item["aspect_ratio"] != "21:9" || item["resolution"] != "4K" {
+		t.Fatalf("槽位未带上原生字段: %v", item)
+	}
+}
+
+// 非法取值要响亮拒绝，不能悄悄回落默认。
+func TestAspectRatioValidation(t *testing.T) {
+	for _, body := range []string{
+		`{"prompt":"x","aspect_ratio":"2:1"}`,
+		`{"prompt":"x","resolution":"8K"}`,
+	} {
+		req, perr := decode(t, body)
+		if perr != nil {
+			t.Fatalf("Decode: %+v", perr)
+		}
+		if _, _, perr := req.Build(); perr == nil || perr.Status != 400 {
+			t.Fatalf("%s: 应 400，实际 %+v", body, perr)
+		}
+	}
+}
