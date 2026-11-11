@@ -1,0 +1,45 @@
+# minimaxcode2api @ ai-prod（210.121.44.245）
+#
+# 部署方式：服务器构建（GHCR 上没有镜像，仓库也没有 Actions 流水线）。
+# 构建：cd /opt/minimaxcode2api/src && docker build -t minimaxcode2api:0.2.0 .
+# 起服务：cd /opt/minimaxcode2api && docker compose up -d
+#
+# 密钥不写在文件里：同目录 .env（chmod 600）提供 MMX2A_API_KEY / MMX2A_ADMIN_PASSWORD。
+services:
+  minimaxcode2api:
+    image: minimaxcode2api:0.2.0
+    container_name: minimaxcode2api
+    restart: unless-stopped
+
+    # 🔴 只绑回环。公网入口一律走 nginx + minimaxcode.1task.cn，
+    # 照抄上游 docker-compose.yml 的 "7864:7864" 等于把无鉴权面裸到公网。
+    ports:
+      - "127.0.0.1:39350:7864"
+
+    environment:
+      MMX2A_API_KEY: ${MMX2A_API_KEY:?需要在 .env 里提供}
+      MMX2A_ADMIN_PASSWORD: ${MMX2A_ADMIN_PASSWORD:?需要在 .env 里提供}
+      MMX2A_LISTEN: ":7864"
+      MMX2A_DATA_DIR: /data
+      # cn = agent.minimax.cn / account.minimax.cn；国际版改 intl（域名整组切换）
+      MMX2A_REGION: cn
+      TZ: Asia/Shanghai
+
+    volumes:
+      # 容器内以 uid 10001 运行 ⇒ 宿主目录必须 chown 10001:10001，否则写 config 时 permission denied
+      - ./data:/data
+
+    healthcheck:
+      # /healthz 在零账号时仍返回 200（只报 ok + uptime），可以当存活探针。
+      # 别拿 /v1/models 当探针——它要鉴权，会把健康容器判死。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7864/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
