@@ -108,7 +108,7 @@ func writeMediaError(w http.ResponseWriter, err error) {
 		case me.IsRequest():
 			code = "invalid_request"
 		case me.IsAuth():
-			code = "account_unavailable"
+			code = "upstream_auth"
 		}
 	}
 	msg := err.Error()

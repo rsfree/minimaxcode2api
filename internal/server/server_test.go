@@ -209,8 +209,17 @@ func TestAllAccountsUnauthorized(t *testing.T) {
 	resp, raw := f.post(t, "/v1/chat/completions",
 		`{"model":"MiniMax-M3.1-Flash","messages":[{"role":"user","content":"hi"}]}`)
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("状态码 = %d，期望 401，body=%s", resp.StatusCode, raw)
+	// 下游的 sk-mmx 已经验过，失效的是网关自己的上游账号 —— 必须是 502。
+	// 回 401 会让客户端以为自己 key 错了，重配/换 key 都无救。
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d，期望 502，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "upstream_auth") {
+		t.Fatalf("错误码应为 upstream_auth，body=%s", raw)
+	}
+	// param 是 OpenAI 错误对象的固定成员，缺失会让严格 SDK 反序列化报警。
+	if !strings.Contains(string(raw), `"param"`) {
+		t.Fatalf("错误对象缺 param 字段: %s", raw)
 	}
 	if n := f.upCalls(); n != 2 {
 		t.Fatalf("上游调用次数 = %d，期望 2（每个账号各一次）", n)

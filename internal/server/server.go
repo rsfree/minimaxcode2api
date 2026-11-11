@@ -110,6 +110,10 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.Mux.HandleFunc("GET /status", s.auth(s.handleStatus))
 	s.Mux.HandleFunc("OPTIONS /", s.handleOptions)
+	// 兜底：没有匹配到任何路由时自己回 JSON 404。
+	// 不注册它的话，Go 的 ServeMux 会因为 "OPTIONS /" 是唯一能匹配的 pattern
+	// 而回纯文本 405，客户端会以为"路径存在但方法错了"，实际是路径根本不存在。
+	s.Mux.HandleFunc("/", s.handleNotFound)
 }
 
 // Handler 返回带通用中间件的入口。
@@ -136,7 +140,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
-		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		h.Set("Access-Control-Max-Age", "86400")
 		next.ServeHTTP(w, r)
 	})
@@ -144,6 +148,12 @@ func (s *Server) cors(next http.Handler) http.Handler {
 
 func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleNotFound 是未匹配路由的兜底，回 JSON 而不是 Go 的纯文本。
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	writeOpenAIError(w, http.StatusNotFound, "unknown_route",
+		"没有这个接口："+r.Method+" "+r.URL.Path+"（见 GET /v1/models 与 README 的路由清单）")
 }
 
 // auth 校验对外 API Key（Bearer 或 x-api-key 均可，方便各种 SDK 直连）。
@@ -358,7 +368,39 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 		"error": map[string]any{
 			"message": msg,
 			"type":    errorType(status),
-			"code":    code,
+			// param 是 OpenAI 错误对象的固定成员，缺失会让严格的 SDK 反序列化报警。
+			// 网关层拿不到字段级的形参名，固定 null 比编一个更诚实。
+			"param": nil,
+			"code":  code,
+		},
+	})
+}
+
+// writeFourKeyError 输出协议的四键错误信封（message / type / param / code）。
+//
+// 图像与视频原本各写一份几乎相同的实现，只差 type 的兜底规则 —— 这种重复
+// 已经让 param 写歪过一次，所以统一到这里，兜底规则仍由调用方给。
+func writeFourKeyError(w http.ResponseWriter, status int, typ, param, code, msg string) {
+	if status == 0 {
+		status = http.StatusBadRequest
+	}
+	if typ == "" {
+		typ = errorType(status)
+	}
+	var p any
+	if param != "" {
+		p = param
+	}
+	var c any
+	if code != "" {
+		c = code
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    typ,
+			"param":   p,
+			"code":    c,
 		},
 	})
 }
@@ -383,6 +425,10 @@ func errorType(status int) string {
 		return "not_found_error"
 	case status == 429:
 		return "rate_limit_error"
+	case status == http.StatusPaymentRequired:
+		// 额度触顶：请求本身没写错，重试也不会好 —— 归 api_error 而不是
+		// invalid_request_error，否则客户端会去翻自己的参数。
+		return "api_error"
 	case status >= 500:
 		return "api_error"
 	default:
@@ -396,7 +442,10 @@ func upstreamStatus(err error) (int, string) {
 	if errors.As(err, &apiErr) {
 		switch {
 		case apiErr.AuthError():
-			return http.StatusUnauthorized, "upstream_auth_failed"
+			// 下游的 sk-mmx 已经过了鉴权，失效的是**网关自己的**上游账号。
+			// 回 401 会让客户端以为自己 key 错了（重配、换 key 都无救），
+			// 这是典型的网关侧故障 —— 502 + upstream_auth 才排得动障。
+			return http.StatusBadGateway, "upstream_auth"
 		case apiErr.Status == http.StatusTooManyRequests:
 			return http.StatusTooManyRequests, "upstream_rate_limited"
 		case apiErr.Status >= 400 && apiErr.Status < 500:
