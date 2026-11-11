@@ -192,8 +192,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | 路由 | 说明 | 状态 |
 |---|---|---|
 | `POST /v1/images/generations` | OpenAI 图片接口，支持 `n` / `size` / `quality` / `response_format=url\|b64_json` / 参考图 `image` | ✅ 真调通过 |
-| `POST /v1/videos/generations` | 提交异步视频任务，支持 `model` / `duration` / `resolution` / `ratio` / `image_url`（首帧） | ✅ 提交通过（额度受限，见下） |
-| `GET /v1/videos/generations/{id}` | 轮询任务，`?model=` 可省（提交时已记住） | ✅ 状态机通过 |
+| 视频四个端点 | 异步视频协议（canonical），见下节 | ✅ 提交/查询/列表/删除全验 |
 | `POST /v1/audio/speech` | 文本转语音，直接回音频字节 | ✅ 真调通过 |
 | `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
 | `POST /v1/audio/music` | 音乐生成，默认回字节，`response_format=url` 回链接 | ✅ 真调通过 |
@@ -244,6 +243,113 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 
 默认 `upstream.timeout_seconds=600`，跑批量图与视频轮询够用；要跑 4K 多图建议调到 900。
 
+## 视频接口（异步视频生成协议）
+
+视频是 Job 型任务：**受理 ≠ 成功**。本网关按 `video-adapter` 的 canonical 契约实现，
+路径与火山方舟一致：
+
+| 方法 | 路径 | 回包 |
+|---|---|---|
+| `POST` | `/v1/contents/generations/tasks` | 只有 `{"id": "…"}` + `Location` 头 |
+| `GET` | `/v1/contents/generations/tasks/{id}` | canonical 任务对象 |
+| `GET` | `/v1/contents/generations/tasks` | `{items[], total}`（真实数据） |
+| `DELETE` | `/v1/contents/generations/tasks/{id}` | 终态删记录；非终态 `501` |
+
+`/api/v3/contents/generations/tasks` 是同一组端点的别名 —— Ark SDK 只改 `base_url` 就能直接用。
+
+### 请求长什么样
+
+```json
+{
+  "model": "MiniMax-H3",
+  "content": [
+    {"type": "text", "text": "海边灯塔，黄昏，镜头缓慢推近"},
+    {"type": "image_url", "image_url": {"url": "https://…/first.png"}, "role": "first_frame"}
+  ],
+  "duration": 6, "resolution": "720p", "ratio": "16:9", "watermark": true
+}
+```
+
+`model` 支持 `MiniMax-H3`（原生音频 + 多模态参考，需 416 credits）与
+`MiniMax-Hailuo-2.3`（需 280 credits），别名 `h3` / `h2.3`。
+
+### 六态与三条硬规矩
+
+状态：`queued` / `running` / `succeeded` / `failed` / `expired` / `cancelled`。
+
+1. **创建响应只有 `id`**。POST 200 只代表受理，成功判据是
+   `status=succeeded` 且 `content.video_url` 非空。
+2. **`video_url` 只在 succeeded 有值**，其余状态一律 `null`。上游会返回
+   `status=succeeded` + `code=503`（"已就绪但还没准备好下发"），网关把这种情况
+   收敛成 `running`，免得客户端拿着一个空 url 当成功。
+3. **未知状态收敛为 `running`**（非终态）并打 `status_unnormalized` 标记，
+   绝不会被当成 succeeded 提前落库。
+
+### 参数双载体
+
+body 字段是强校验，prompt 后缀是弱校验：
+
+```json
+{"content":[{"type":"text","text":"小猫打哈欠 --rs 720p --rt 16:9 --dur 6 --wm true"}]}
+```
+
+网关会**剥离后缀 → 回填字段 → 只发强校验给上游**；body 与后缀冲突时 body 优先，
+并记 `warnings`（在 GET 的任务对象里可见）。这不是洁癖：后缀留在提示词里会被模型
+当画面文字读出来，而拼错的后缀会被上游静默忽略 —— 请求 200、任务成功、就是时长不对。
+
+### 校验与拒绝
+
+判定顺序固定：`content → model → 场景互斥 → 参数取值域`。只拒四类：
+
+- `content` 缺失 / 空数组 / 元素缺 url；
+- `model` 缺失或不在支持列表；
+- **首帧/首尾帧与全模态参考混用**（"首尾帧变成参考图"事故的根源）；
+- 计费相关字段非法（`resolution` / `ratio` / `duration` / `frames`）。
+
+`resolution` 是**档位不是像素**，上游只有 768P/1080P/2K：`720p→768P`；
+`1080p` 在 H3 上换算成 `2K`；`4k` 换算成该模型最高档并给 warning；
+`480p` 直接 400（没有对应档位，静默升档会改账单）。`frames` 与 `duration=-1`
+上游都不支持 → 400。
+
+### 错误归因
+
+四键信封 `{message, type, param, code}`，按「谁的错」翻译而不是照抄上游码：
+
+| 场景 | HTTP | code |
+|---|---|---|
+| 参数错 | 400 | `invalid_request` / `unsupported_parameter` |
+| 运行期内容审核（在任务对象 `error` 里） | 400 | `content_filter` |
+| 上游账号失效 | 502 | `upstream_auth` |
+| 额度不足 | **402** | `insufficient_quota` |
+| 网络 / 5xx | 502 | `upstream_error` |
+
+> 402 是**有意的偏离**：协议把渠道问题归到 5xx，但对自建网关来说"余额不足"和
+> "上游挂了"是两种完全不同的处置，保留 402 才排得动障。
+
+### 任务对象
+
+```json
+{
+  "id": "462168147714259", "model": "MiniMax-Hailuo-2.3", "status": "running",
+  "content": {"video_url": null, "last_frame_url": null},
+  "error": null, "created_at": 1794386542, "updated_at": 1794388710,
+  "duration": 6, "resolution": "720p", "ratio": "16:9"
+}
+```
+
+参数回显不丢（计费对账要用）。`usage` 只有上游给出时才带 —— 当前媒体接口不返回
+token 用量，所以通常没有这一项，这是**已知缺口**而不是省略。
+
+任务快照落盘在 `data/videotasks.json`，重启后仍可查：上游查询必须带 model，
+而协议客户端轮询只带 id，所以提交那一刻就得记下来。
+
+### 已知边界
+
+- **不做回调**：`callback_url` 接受但记 warning，请用 GET 轮询（上游本身也不支持）；
+- **不做取消**：上游没有取消接口，DELETE 只删本地记录，非终态返回 501；
+- 参考视频要额外给 `reference_video_duration_seconds`（上游拿它校验，网关无法可靠探测远程时长）；
+- 参考图 / 参考视频 / 参考音频只支持 `MiniMax-H3`。
+
 ## 国内版 / 国际版
 
 客户端二进制里是**一套双区域映射**（`dist/main/config/constants.js`）：
@@ -266,7 +372,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 - 不做 `/v1/responses`、embeddings、rerank；
 - 不做「视觉理解 / 联网搜索」的独立路由：视觉走 `/v1/chat/completions` 的图片输入即可
   （上游 `images_understand`、`web_search` 这些工具能调通，但属于 agent 内部工具，没做成对外 API）；
-- 视频只做「提交 + 轮询」，不做回调（上游不支持 callback_url）；
+- 视频不做回调、不做取消（上游两者都不支持，见上一节）；
 - 不做计费与配额，用量只统计不扣费；
 - 不做多用户/RBAC，面板是单人运维工具；
 - 请求日志只在内存环形缓冲里，重启即清空（长期审计请接外部日志）；

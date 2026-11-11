@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,10 +24,11 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/store"
 	"github.com/linguo2625469/minimaxcode2api/internal/upstream"
 	"github.com/linguo2625469/minimaxcode2api/internal/usage"
+	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
 )
 
 // Version 网关版本。
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Server 网关主对象。
 type Server struct {
@@ -44,9 +46,9 @@ type Server struct {
 	// 触发轮换，把彼此刷成 invalid_grant。
 	refreshLocks sync.Map
 	usageDirty   chan struct{}
-	// videoTasks 记住 task_id -> model。轮询接口的 model 是必填的，
-	// 但 OpenAI 风格的客户端只会带 task id，所以提交时先存下来。
-	videoTasks sync.Map
+	// VideoTasks 视频任务快照（id -> model/参数/状态）。上游查询要求传 model，
+	// 而协议客户端轮询只带 id，所以必须在提交时记下来；落盘以便重启后仍可查。
+	VideoTasks *videotask.Store
 }
 
 // New 组装服务。
@@ -71,6 +73,14 @@ func New(
 		Mux:        http.NewServeMux(),
 		usageDirty: make(chan struct{}, 1),
 	}
+	// 视频任务快照落盘；打不开就退化成内存库（视频不是关键路径，不该阻塞启动）。
+	videoPath := filepath.Join(cfg.Load().DataDir, "videotasks.json")
+	if vs, err := videotask.Open(videoPath); err == nil {
+		s.VideoTasks = vs
+	} else {
+		log.Printf("视频任务库打开失败（降级为内存）: %v", err)
+		s.VideoTasks = videotask.NewMemory()
+	}
 	s.routes()
 	go s.usageFlusher()
 	return s
@@ -83,8 +93,15 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
 	// 媒体接口：上游是 /mavis/api/v1/mcp/*，鉴权与文本一致。
 	s.Mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
-	s.Mux.HandleFunc("POST /v1/videos/generations", s.auth(s.handleVideoCreate))
-	s.Mux.HandleFunc("GET /v1/videos/generations/{id}", s.auth(s.handleVideoGet))
+	// 视频走「异步视频生成协议」的 canonical 路径。同时挂 /v1 与 /api/v3：
+	// 前者是本网关的惯例，后者让 Ark SDK 只需改 base_url 就能直接用。
+	for _, prefix := range []string{"/v1", "/api/v3"} {
+		base := prefix + "/contents/generations/tasks"
+		s.Mux.HandleFunc("POST "+base, s.auth(s.createVideoTask))
+		s.Mux.HandleFunc("GET "+base, s.auth(s.listVideoTasks))
+		s.Mux.HandleFunc("GET "+base+"/{id}", s.auth(s.getVideoTask))
+		s.Mux.HandleFunc("DELETE "+base+"/{id}", s.auth(s.deleteVideoTask))
+	}
 	s.Mux.HandleFunc("GET /v1/voices", s.auth(s.handleVoices))
 	s.Mux.HandleFunc("POST /v1/audio/speech", s.auth(s.handleSpeech))
 	s.Mux.HandleFunc("POST /v1/audio/transcriptions", s.auth(s.handleTranscriptions))
