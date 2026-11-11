@@ -484,6 +484,8 @@ tbody tr:hover { background: var(--surface-2); }
   border-radius: 999px;
   box-shadow: 0 10px 30px -10px rgba(0, 0, 0, .5);
   opacity: 0;
+  /* 提示是不可点的浮层：淡出后仍留在 DOM 里，别挡住底下的按钮 */
+  pointer-events: none;
   transition: opacity .18s var(--ease), transform .18s var(--ease);
   pointer-events: none;
   z-index: 80;
