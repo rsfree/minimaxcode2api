@@ -33,7 +33,7 @@ type Request struct {
 	Model          string
 	Size           string
 	Quality        string
-	// AspectRatio / Resolution 是 MiniMax 上游的原生档位（1K/2K/4K + 六种比例），
+	// AspectRatio / Resolution 是 MiniMax 上游的原生档位（1K/2K/4K + 十种比例），
 	// 不属于 OpenAI 协议。它们必须显式进 items —— 当成 vendor extra 透传到顶层
 	// 会被上游忽略，表现为"请求了 21:9 却回 1:1"。
 	AspectRatio string
@@ -269,7 +269,7 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 	// 这里做「客户端吸附」而不是严格拒绝：上游确实会吸附，但方式不可靠 ——
 	// 实测 `abc`/`8K` 静默回落到 16:9/1K（悄悄改档位等于悄悄改账单），
 	// 而 `2:1`/`7:3` 这类"看着合法"的比例会直接生成失败。所以由我们先吸附成
-	// 合法的六种比例 / 三档，再下发，并把吸附结果回给调用方。
+	// 合法的比例 / 三档，再下发，并把吸附结果回给调用方。
 	if r.AspectRatio != "" {
 		snapped, ok := SnapRatio(r.AspectRatio)
 		if !ok {
@@ -278,7 +278,7 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 		}
 		if snapped != r.AspectRatio {
 			warnings = append(warnings, fmt.Sprintf(
-				"aspect_ratio %q 已吸附为 %s（上游只输出六种比例，像素按 16 栅格对齐）",
+				"aspect_ratio %q 已吸附为 %s（上游只接受固定比例，像素按 16 栅格对齐）",
 				r.AspectRatio, snapped))
 		}
 		ratio = snapped
@@ -332,8 +332,8 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 
 // Shape 把 size/quality 映射成上游的 (aspect_ratio, resolution)。
 //
-// 上游是"档位 × 比例"的矩阵，不是自由 WxH：档位 1K/2K/4K，比例 21:9/16:9/4:3/
-// 1:1/3:4/9:16。所以自由像素必须先换算，换算不了就按最近档 —— 绝不能原样发。
+// 上游是"档位 × 比例"的矩阵，不是自由 WxH：档位 1K/2K/4K，比例见
+// upstreamRatios（实测十种）。所以自由像素必须先换算，换算不了就按最近档 —— 绝不能原样发。
 func Shape(size, quality string) (ratio, resolution string) {
 	ratio = ratioFromSize(size)
 	if ratio == "" {
@@ -350,16 +350,30 @@ func Shape(size, quality string) (ratio, resolution string) {
 	return ratio, resolution
 }
 
-// sixRatios 是上游实际输出的六种比例（像素按 16 栅格对齐，比例本身是吸附值）。
-var sixRatios = []struct {
+// upstreamRatios 是上游实测支持的比例（像素按 16 栅格对齐，比例本身是吸附值）。
+//
+// 2026-11-12 直连 image_synthesize 逐个验过，比原先记录的六种多四种：
+//
+//	支持    21:9 16:9 3:2 4:3 5:4 1:1 4:5 3:4 2:3 9:16
+//	不支持  3:1 / 1:3（客户端 UI 有这两个选项，但上游 1s 内失败）
+//
+// 1K 档实测：3:2=1264×848、5:4=1152×928、4:5=928×1152、2:3=848×1264。
+// 不照抄 UI 那 12 个选项，是因为它们来自服务端下发的
+// agent_generation_controls_config，并不等于后端能力 —— 3:1/1:3 就是反例。
+var upstreamRatios = []struct {
 	label string
 	value float64
 }{
-	{"21:9", 21.0 / 9.0}, {"16:9", 16.0 / 9.0}, {"4:3", 4.0 / 3.0},
-	{"1:1", 1}, {"3:4", 3.0 / 4.0}, {"9:16", 9.0 / 16.0},
+	{"21:9", 21.0 / 9.0}, {"16:9", 16.0 / 9.0}, {"3:2", 3.0 / 2.0},
+	{"4:3", 4.0 / 3.0}, {"5:4", 5.0 / 4.0}, {"1:1", 1},
+	{"4:5", 4.0 / 5.0}, {"3:4", 3.0 / 4.0}, {"2:3", 2.0 / 3.0},
+	{"9:16", 9.0 / 16.0},
 }
 
 // SnapRatio 把任意 "W:H"（也接受 "W/H"）吸附到最接近的合法比例。
+//
+// 表外比例（含上游不支持的 3:1 / 1:3）不会 400：最近邻降级 + warning，
+// 比让上游跑一秒再失败更有用。
 //
 // 用对数距离而不是差值：2:1 与 16:9 的差是 0.22，与 21:9 的差是 0.33，
 // 但按比例尺它们分别差 11% 与 14%，人眼与模型都更接近 16:9。
@@ -377,7 +391,7 @@ func SnapRatio(v string) (string, bool) {
 	}
 	target := math.Log(w / h)
 	best, bestDiff := "1:1", math.MaxFloat64
-	for _, r := range sixRatios {
+	for _, r := range upstreamRatios {
 		if d := math.Abs(math.Log(r.value) - target); d < bestDiff {
 			best, bestDiff = r.label, d
 		}
@@ -464,7 +478,7 @@ func resolutionFromSize(size string) string {
 	return resolutionFromLongest(float64(longest))
 }
 
-// ratioFromSize 找最近的合法比例。上游只认六种比例，所以 size 也要吸附。
+// ratioFromSize 找最近的合法比例。上游只认 upstreamRatios 这一张表，所以 size 也要吸附。
 // 直接复用 SnapRatio，避免两处各维护一份比例表（改一处忘一处就会分叉）。
 func ratioFromSize(size string) string {
 	w, h, ok := parseWH(size)
