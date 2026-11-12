@@ -276,3 +276,33 @@ func TestRatioFromSizeSnaps(t *testing.T) {
 		}
 	}
 }
+
+// Auto 是 MiniMax 客户端的默认档位（截图里的「比例 Auto / 4K」）。
+// 语义是「不指定，交给上游按 prompt 决定」：必须解析成功，且槽位里
+// 完全不要出现 aspect_ratio / resolution 这两个键 —— 写空串仍然算指定。
+func TestBuildAutoOmitsShapeKeys(t *testing.T) {
+	req, perr := decode(t, `{"prompt":"海边灯塔","aspect_ratio":"auto","resolution":"Auto"}`)
+	if perr != nil {
+		t.Fatalf("auto 不该被拒: %+v", perr)
+	}
+	payload, warns, perr := req.Build()
+	if perr != nil {
+		t.Fatalf("Build: %+v", perr)
+	}
+	if len(warns) == 0 {
+		t.Fatal("auto 应给出 warnings，说明由上游决定")
+	}
+	items := payload["requests"].([]map[string]any)
+	if len(items) != 1 {
+		t.Fatalf("槽位数 = %d，期望 1", len(items))
+	}
+	if _, ok := items[0]["aspect_ratio"]; ok {
+		t.Fatalf("aspect_ratio 不该出现: %+v", items[0])
+	}
+	if _, ok := items[0]["resolution"]; ok {
+		t.Fatalf("resolution 不该出现: %+v", items[0])
+	}
+	if items[0]["prompt"] != "海边灯塔" || items[0]["output_file"] == "" {
+		t.Fatalf("其余字段应保留: %+v", items[0])
+	}
+}

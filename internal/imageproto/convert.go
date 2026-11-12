@@ -251,6 +251,19 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 	}
 
 	ratio, resolution := Shape(r.Size, r.Quality)
+	// 客户端 UI 的「Auto」= 不指定档位，交给上游按 prompt 决定。
+	// 这是 MiniMax 客户端的默认档位：既不能当非法值 400，也不能静默换成
+	// 1:1 —— 用户选了「自动」却每张都是方图，比报错更难发现。
+	if strings.EqualFold(strings.TrimSpace(r.AspectRatio), "auto") {
+		r.AspectRatio = ""
+		ratio = ""
+		warnings = append(warnings, "aspect_ratio=auto：不指定比例，由上游按 prompt 决定")
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Resolution), "auto") {
+		r.Resolution = ""
+		resolution = ""
+		warnings = append(warnings, "resolution=auto：不指定档位，由上游决定")
+	}
 	// 上游原生字段优先于 size/quality 推导（显式 > 推导）。
 	//
 	// 这里做「客户端吸附」而不是严格拒绝：上游确实会吸附，但方式不可靠 ——
@@ -286,10 +299,15 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 	items := make([]map[string]any, 0, n)
 	for i := 0; i < n; i++ {
 		item := map[string]any{
-			"prompt":       r.Prompt,
-			"output_file":  "slot_" + strconv.Itoa(i) + ".png",
-			"aspect_ratio": ratio,
-			"resolution":   resolution,
+			"prompt":      r.Prompt,
+			"output_file": "slot_" + strconv.Itoa(i) + ".png",
+		}
+		// 空值 = 客户端明确要 Auto，此时**整个键都不写**，不是写空串。
+		if ratio != "" {
+			item["aspect_ratio"] = ratio
+		}
+		if resolution != "" {
+			item["resolution"] = resolution
 		}
 		if len(r.Image) > 0 {
 			item["input_urls"] = r.Image
