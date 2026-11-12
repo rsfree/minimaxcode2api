@@ -7,6 +7,7 @@ package videotask
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,13 @@ import (
 
 // TTL 任务记录的保留时长。协议里任务 ID 的寿命是 7 天，过期的直接 prune。
 const TTL = 7 * 24 * time.Hour
+
+var (
+	// ErrNotFound 任务不存在（网关本地没有快照）。
+	ErrNotFound = errors.New("任务不存在")
+	// ErrNotTerminal 任务还没到终态，不能删除。
+	ErrNotTerminal = errors.New("任务还在进行中")
+)
 
 // Params 是要原样回显给客户端的参数。
 type Params struct {

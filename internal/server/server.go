@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/convert"
 	"github.com/linguo2625469/minimaxcode2api/internal/oauth"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
+	"github.com/linguo2625469/minimaxcode2api/internal/quota"
 	"github.com/linguo2625469/minimaxcode2api/internal/reqlog"
 	"github.com/linguo2625469/minimaxcode2api/internal/store"
 	"github.com/linguo2625469/minimaxcode2api/internal/upstream"
@@ -28,7 +29,7 @@ import (
 )
 
 // Version 网关版本。
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // Server 网关主对象。
 type Server struct {
@@ -49,6 +50,14 @@ type Server struct {
 	// VideoTasks 视频任务快照（id -> model/参数/状态）。上游查询要求传 model，
 	// 而协议客户端轮询只带 id，所以必须在提交时记下来；落盘以便重启后仍可查。
 	VideoTasks *videotask.Store
+
+	// 自动签到的"这一次跑过了"标记（分钟级去重，见 signin_sched.go）。
+	signinMu     sync.Mutex
+	signinRunKey string
+	// Quota 读账号的图片免费额度（/minimax-cloud 前缀，与 /mavis 不同根路径）。
+	Quota      *quota.Client
+	quotaMu    sync.Mutex
+	quotaCache map[string]quotaEntry
 }
 
 // New 组装服务。
@@ -72,6 +81,8 @@ func New(
 		Start:      time.Now(),
 		Mux:        http.NewServeMux(),
 		usageDirty: make(chan struct{}, 1),
+		Quota:      quota.New(nil),
+		quotaCache: map[string]quotaEntry{},
 	}
 	// 视频任务快照落盘；打不开就退化成内存库（视频不是关键路径，不该阻塞启动）。
 	videoPath := filepath.Join(cfg.Load().DataDir, "videotasks.json")
@@ -83,6 +94,7 @@ func New(
 	}
 	s.routes()
 	go s.usageFlusher()
+	s.startSigninScheduler()
 	return s
 }
 

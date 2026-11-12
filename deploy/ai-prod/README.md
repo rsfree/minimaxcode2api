@@ -6,7 +6,7 @@
 |---|---|
 | 机器 | `210.121.44.245`（首尔 AS9848），root + `~/.ssh/id_ed25519_ops` |
 | 服务目录 | `/opt/minimaxcode2api/`（`src/` 源码、`data/` 运行时、`nginx/` 脚本与片段） |
-| 容器 | `minimaxcode2api:0.3.0`，`restart: unless-stopped`，非 root（uid 10001） |
+| 容器 | `minimaxcode2api:0.4.0`，`restart: unless-stopped`，非 root（uid 10001） |
 | 监听 | **仅回环** `127.0.0.1:39350` → 容器 `7864` |
 | 入口 | 宝塔 nginx：`:80` 一律 301 → `:443` 反代回环 |
 | 证书 | `/www/server/panel/vhost/cert/minimaxcode.1task.cn/`（acme.sh，到期 2027-02-09，自动续期） |

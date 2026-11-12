@@ -8,6 +8,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -125,6 +126,10 @@ type Signin struct {
 	// CloudBase 云服务基址（到 /api/v1 为止）。留空则由 upstream.base_url
 	// 的 origin 推导：https://agent.minimax.cn/minimax-cloud/api/v1
 	CloudBase string `json:"cloud_base"`
+	// Auto 每天自动签一次（进程内定时器，不依赖外部 crontab）。
+	Auto bool `json:"auto"`
+	// At 自动签到的时刻，HH:MM（按 Timezone 计算），默认 00:10。
+	At string `json:"at"`
 }
 
 type Config struct {
@@ -209,6 +214,8 @@ func Default() *Config {
 		},
 		Signin: Signin{
 			Timezone: "Asia/Shanghai",
+			Auto:     true,
+			At:       "00:10",
 		},
 	}
 }
@@ -230,6 +237,11 @@ func Load(path string) (*Config, error) {
 		cfg.applyEnv()
 		cfg.ApplyRegionPreset()
 		cfg.fillDefaults()
+		// Auto 的零值是 false："没写过 signin 段"（升级前的老配置）应默认开启，
+		// 而显式写了 "auto": false 必须尊重 —— 所以只能看原始 JSON 有没有这个键。
+		if !bytes.Contains(raw, []byte(`"signin"`)) {
+			cfg.Signin.Auto = true
+		}
 		return cfg, nil
 	}
 
@@ -397,6 +409,9 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Signin.Timezone == "" {
 		c.Signin.Timezone = d.Signin.Timezone
+	}
+	if c.Signin.At == "" {
+		c.Signin.At = d.Signin.At
 	}
 	if c.Defaults.Model == "" {
 		c.Defaults.Model = d.Defaults.Model

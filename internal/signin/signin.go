@@ -191,3 +191,18 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// Result 单个账号的签到结果。
+//
+// 放在这个包而不是 server/panel 各自定义：/signin 端点、面板签到页、
+// 自动签到定时器都要序列化同一份结构，三处分叉迟早会出现字段名漂移。
+type Result struct {
+	AccountID   string `json:"account_id"`
+	Label       string `json:"label,omitempty"`
+	OK          bool   `json:"ok"`
+	Claimed     bool   `json:"claimed"`
+	DayNo       int    `json:"day_no,omitempty"`
+	Points      int    `json:"points"`
+	TodayStatus int    `json:"today_status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}

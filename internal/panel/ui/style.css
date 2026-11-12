@@ -369,6 +369,32 @@ tbody tr:hover { background: var(--surface-2); }
 .badge.err { background: var(--err-weak); color: var(--err); }
 .badge.accent { background: var(--accent-weak); color: var(--accent); }
 
+/* ---------- 图片生成额度 ---------- */
+.quota-list { display: flex; flex-direction: column; gap: 10px; }
+.quota-row { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+.quota-row .q-name { min-width: 150px; }
+.quota-row .q-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.quota-row .q-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width .3s var(--ease);
+}
+.quota-row .q-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.quota-row .q-err { color: var(--err); font-size: 12.5px; }
+
 .kv-list { display: flex; flex-direction: column; gap: 10px; }
 .kv {
   display: flex;
@@ -537,3 +563,25 @@ tbody tr:hover { background: var(--surface-2); }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- 任务 / 签到 ---------- */
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.form-row .inline-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.form-row .inline-field input {
+  width: 72px;
+  padding: 6px 8px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+#view-tasks td a.btn { text-decoration: none; display: inline-flex; align-items: center; }

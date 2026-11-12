@@ -70,6 +70,13 @@ func main() {
 		Logs:    logs,
 		Version: server.Version,
 		Start:   time.Now(),
+		Quota:   srv.ImageQuotaForAccount,
+
+		VideoTasks:     srv.VideoTasks,
+		SigninStatus:   srv.SigninStatus,
+		SigninAccounts: srv.SigninAccounts,
+		RefreshTask:    srv.RefreshTaskByID,
+		DeleteTask:     srv.DeleteTask,
 	}).Mount(srv.Mux)
 
 	httpSrv := &http.Server{

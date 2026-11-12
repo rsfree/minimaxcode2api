@@ -19,10 +19,13 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/convert"
 	"github.com/linguo2625469/minimaxcode2api/internal/oauth"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
+	"github.com/linguo2625469/minimaxcode2api/internal/quota"
 	"github.com/linguo2625469/minimaxcode2api/internal/reqlog"
+	"github.com/linguo2625469/minimaxcode2api/internal/signin"
 	"github.com/linguo2625469/minimaxcode2api/internal/store"
 	"github.com/linguo2625469/minimaxcode2api/internal/upstream"
 	"github.com/linguo2625469/minimaxcode2api/internal/usage"
+	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
 )
 
 // Deps 面板依赖。
@@ -36,6 +39,18 @@ type Deps struct {
 	Logs    *reqlog.Log
 	Version string
 	Start   time.Time
+
+	// Quota 取某账号的图片生成免费额度。由 server 注入（带 token 刷新与缓存），
+	// 面板本身不碰凭据生命周期 —— 否则会和主链路抢同一把 refresh_token。
+	Quota func(ctx context.Context, acct store.Account) (*quota.ImageFree, error)
+
+	// 以下由 server 注入：面板只做展示，业务逻辑（token 刷新、上游查询、
+	// 领取签到）留在 server —— 面板再造一份必然和主链路分叉。
+	VideoTasks     *videotask.Store
+	SigninStatus   func(ctx context.Context, accountID string) ([]signin.Result, error)
+	SigninAccounts func(ctx context.Context, accountID string) ([]signin.Result, error)
+	RefreshTask    func(ctx context.Context, id string) (*videotask.Record, error)
+	DeleteTask     func(id string) error
 }
 
 type Panel struct {
@@ -58,6 +73,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("POST /panel/api/login", p.login)
 	mux.HandleFunc("GET /panel/api/overview", p.authed(p.overview))
+	mux.HandleFunc("GET /panel/api/quota", p.authed(p.quota))
 	mux.HandleFunc("GET /panel/api/accounts", p.authed(p.accounts))
 	mux.HandleFunc("POST /panel/api/accounts/device/start", p.authed(p.deviceStart))
 	mux.HandleFunc("GET /panel/api/accounts/device/poll", p.authed(p.devicePoll))
@@ -73,6 +89,11 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/api/config", p.authed(p.getConfig))
 	mux.HandleFunc("POST /panel/api/config", p.authed(p.setConfig))
 	mux.HandleFunc("POST /panel/api/probe", p.authed(p.probe))
+	mux.HandleFunc("GET /panel/api/tasks", p.authed(p.tasks))
+	mux.HandleFunc("POST /panel/api/tasks/{id}/sync", p.authed(p.taskSync))
+	mux.HandleFunc("POST /panel/api/tasks/{id}/delete", p.authed(p.taskDelete))
+	mux.HandleFunc("GET /panel/api/signin", p.authed(p.signinStatus))
+	mux.HandleFunc("POST /panel/api/signin", p.authed(p.signinClaim))
 }
 
 // ---------- 鉴权 ----------
@@ -143,6 +164,45 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"strategy":  cfg.Pool.Strategy,
 		"logs":      p.d.Logs.Len(),
 	})
+}
+
+// quota 返回各账号的「图片生成免费额度」。
+//
+// 口径说明：这是**次数**池（限时免费 10 次），与 5 小时/周窗口、积分余额都不是
+// 同一个池子。所以它只做展示，不参与调度决策 —— 拿它判断"还能不能生成"会错。
+func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
+	accounts := p.d.Store.List()
+	out := make([]map[string]any, 0, len(accounts))
+	anyActive := false
+	for _, a := range accounts {
+		if a.Disabled {
+			continue
+		}
+		// 多了会拖慢概览（每个账号一次上游往返），只展示前 5 个。
+		if len(out) >= 5 {
+			break
+		}
+		item := map[string]any{"id": a.ID, "label": firstNonEmpty(a.Label, a.ID)}
+		if p.d.Quota == nil {
+			item["error"] = "额度接口未配置"
+			out = append(out, item)
+			continue
+		}
+		q, err := p.d.Quota(r.Context(), a)
+		switch {
+		case err != nil:
+			item["error"] = err.Error()
+		case q != nil:
+			item["total"] = q.Total
+			item["used"] = q.Used
+			item["remaining"] = q.Remaining
+			item["active"] = q.Active
+			item["fetched_at"] = q.FetchedAt.Local().Format("2006-01-02 15:04:05")
+			anyActive = anyActive || q.Active
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "any_active": anyActive})
 }
 
 // ---------- 账号 ----------
@@ -599,6 +659,8 @@ func (p *Panel) setConfig(w http.ResponseWriter, r *http.Request) {
 		Aliases         map[string]string `json:"aliases"`
 		Hidden          []string          `json:"hidden"`
 		Expose          []string          `json:"expose"`
+		SigninAuto      *bool             `json:"signin_auto"`
+		SigninAt        *string           `json:"signin_at"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_body", err.Error())
@@ -652,6 +714,18 @@ func (p *Panel) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.Expose != nil && len(patch.Expose) > 0 {
 		next.Models.Expose = patch.Expose
+	}
+	if patch.SigninAuto != nil {
+		next.Signin.Auto = *patch.SigninAuto
+	}
+	if patch.SigninAt != nil {
+		at := strings.TrimSpace(*patch.SigninAt)
+		var h, m int
+		if _, err := fmt.Sscanf(at, "%d:%d", &h, &m); err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+			writeErr(w, http.StatusBadRequest, "invalid_body", "signin_at 需要 HH:MM，收到 "+at)
+			return
+		}
+		next.Signin.At = fmt.Sprintf("%02d:%02d", h, m)
 	}
 
 	if err := next.Save(); err != nil {

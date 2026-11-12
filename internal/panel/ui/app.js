@@ -12,6 +12,7 @@
     key: localStorage.getItem(KEY_STORE) || '',
     view: 'overview',
     accounts: [],
+    tasks: [],
     pollTimer: null,
     logTimer: null,
     busy: false,
@@ -129,12 +130,14 @@
     state.key = '';
     stopPolling();
     stopLogAuto();
+    stopTaskAuto();
+    stopTaskSync();
     showGate();
   });
 
   // ---------- 路由 ----------
 
-  const views = ['overview', 'accounts', 'models', 'logs', 'settings'];
+  const views = ['overview', 'accounts', 'models', 'tasks', 'signin', 'logs', 'settings'];
 
   function navigate(hash, silent) {
     const name = String(hash || '').replace(/^#\/?/, '') || 'overview';
@@ -149,9 +152,16 @@
   window.addEventListener('hashchange', () => navigate(location.hash, true));
 
   function loadView(view) {
+    // 离开任务页就停掉轮询：面板切走了还在后台打上游，是最容易忘的泄漏。
+    if (view !== 'tasks') {
+      stopTaskAuto();
+      stopTaskSync();
+    }
     if (view === 'overview') { loadOverview(); loadUsage(); }
     if (view === 'accounts') loadAccounts();
     if (view === 'models') loadModels();
+    if (view === 'tasks') loadTasks();
+    if (view === 'signin') loadSignin();
     if (view === 'logs') loadLogs();
     if (view === 'settings') loadConfig();
   }
@@ -164,6 +174,7 @@
       $('#ver').textContent = 'v' + d.version;
       renderStats(d);
       renderEndpoints(d);
+      loadQuota();
     } catch (err) {
       if (err.status === 401) return showGate();
       toast(err.message, true);
@@ -208,6 +219,60 @@
       row.appendChild(el('span', 'k', k));
       row.appendChild(el('span', 'v mono', v));
       box.appendChild(row);
+    }
+  }
+
+  // 图片生成额度：次数池，读不到就只显示原因，绝不影响概览其它部分。
+  async function loadQuota() {
+    const card = $('#quota-card');
+    if (!card) return;
+    try {
+      const d = await api('/panel/api/quota');
+      renderQuota(d);
+    } catch (err) {
+      if (err.status === 401) return showGate();
+      card.hidden = false;
+      const box = $('#quota-list');
+      box.textContent = '';
+      box.appendChild(el('div', 'q-err', '额度读取失败：' + err.message));
+    }
+  }
+
+  function renderQuota(d) {
+    const card = $('#quota-card');
+    const box = $('#quota-list');
+    const list = (d && d.accounts) || [];
+    if (!card || !box) return;
+    if (!list.length) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    box.textContent = '';
+    for (const q of list) {
+      const row = el('div', 'quota-row');
+      row.appendChild(el('div', 'q-name', q.label || q.id));
+      if (q.error) {
+        row.appendChild(el('div', 'q-err', '读取失败：' + q.error));
+        box.appendChild(row);
+        continue;
+      }
+      const bar = el('div', 'q-bar');
+      const fill = el('i');
+      const total = Number(q.total) || 0;
+      const used = Number(q.used) || 0;
+      const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      row.appendChild(el('div', 'q-num', `已用 ${used} / ${total}　剩余 ${Number(q.remaining) || 0}`));
+      box.appendChild(row);
+    }
+    const note = $('#quota-note');
+    if (note) {
+      note.textContent = d.any_active
+        ? '限时免费 · 按次数计'
+        : '当前不在免费活动期';
     }
   }
 
@@ -577,6 +642,300 @@
   }
 
   $('#refresh-models').addEventListener('click', loadModels);
+
+  // ---------- 任务 ----------
+
+  // 六态与上游视频协议一致；未知状态由网关收敛成 running 并标 unnormalized。
+  const TASK_STATE = {
+    queued: ['排队中', 'badge'],
+    running: ['进行中', 'badge accent'],
+    succeeded: ['已完成', 'badge ok'],
+    failed: ['失败', 'badge err'],
+    expired: ['已过期', 'badge warn'],
+    cancelled: ['已取消', 'badge warn'],
+  };
+  const TASK_TERMINAL = ['succeeded', 'failed', 'expired', 'cancelled'];
+
+  let taskTimer = null;
+  let taskSyncTimer = null;
+
+  async function loadTasks() {
+    try {
+      const d = await api('/panel/api/tasks?limit=200');
+      state.tasks = d.items || [];
+      renderTasks(state.tasks);
+    } catch (err) {
+      if (err.status === 401) return showGate();
+      toast(err.message, true);
+    }
+  }
+
+  function renderTasks(items) {
+    const box = $('#tasks-body');
+    box.textContent = '';
+    if (!items.length) {
+      box.appendChild(el('div', 'empty', '还没有任务。通过 /v1/contents/generations/tasks 提交的异步任务会出现在这里。'));
+      return;
+    }
+    const table = el('table');
+    const thead = el('thead');
+    const htr = el('tr');
+    ['创建', '任务 ID', '模型', '状态', '参数', '更新', '操作'].forEach((h) => htr.appendChild(el('th', '', h)));
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    const tbody = el('tbody');
+    for (const t of items) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'num small', fmtClock(t.created_at ? new Date(t.created_at * 1000).toISOString() : '')));
+
+      const tdID = el('td', 'mono small', t.id);
+      tdID.style.maxWidth = '180px';
+      tdID.style.overflow = 'hidden';
+      tdID.style.textOverflow = 'ellipsis';
+      tr.appendChild(tdID);
+
+      tr.appendChild(el('td', 'mono small', t.client_model || t.upstream_model || '—'));
+
+      const tdState = el('td');
+      const [label, cls] = TASK_STATE[t.status] || [t.status || '未知', 'badge'];
+      tdState.appendChild(el('span', cls, label));
+      if (t.unnormalized_status) tdState.appendChild(el('span', 'badge warn', '未归一'));
+      tr.appendChild(tdState);
+
+      const p = t.params || {};
+      const bits = [];
+      if (p.resolution) bits.push(p.resolution);
+      if (p.ratio) bits.push(p.ratio);
+      if (p.duration) bits.push(p.duration + 's');
+      tr.appendChild(el('td', 'small muted', bits.join(' · ') || '—'));
+
+      const tdUpd = el('td', 'small muted');
+      tdUpd.textContent = t.updated_at ? fmtClock(new Date(t.updated_at * 1000).toISOString()) : '—';
+      if (t.error_message) {
+        tdUpd.appendChild(el('div', 'small', t.error_message.slice(0, 60))).style.color = 'var(--err)';
+      }
+      tr.appendChild(tdUpd);
+
+      const tdOps = el('td');
+      const ops = el('div');
+      ops.style.display = 'flex';
+      ops.style.gap = '4px';
+
+      if (!TASK_TERMINAL.includes(t.status)) {
+        ops.appendChild(opBtn('同步', async () => {
+          try {
+            await api(`/panel/api/tasks/${encodeURIComponent(t.id)}/sync`, { method: 'POST', body: '{}' });
+            toast('已同步上游状态');
+          } catch (err) {
+            toast(err.message, true);
+          }
+          loadTasks();
+        }));
+      } else {
+        if (t.video_url) {
+          const a = el('a', 'btn btn-ghost', '产物');
+          a.href = t.video_url;
+          a.target = '_blank';
+          a.rel = 'noopener';
+          a.style.padding = '4px 8px';
+          a.style.fontSize = '12px';
+          ops.appendChild(a);
+        }
+        const del = opBtn('删除', async () => {
+          if (!confirm(`删除任务 ${t.id} 的本地记录？`)) return;
+          try {
+            await api(`/panel/api/tasks/${encodeURIComponent(t.id)}/delete`, { method: 'POST', body: '{}' });
+            toast('已删除');
+          } catch (err) {
+            toast(err.message, true);
+          }
+          loadTasks();
+        });
+        del.className = 'btn btn-ghost btn-danger';
+        ops.appendChild(del);
+      }
+
+      tdOps.appendChild(ops);
+      tr.appendChild(tdOps);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }
+
+  function stopTaskAuto() {
+    if (taskTimer) {
+      clearInterval(taskTimer);
+      taskTimer = null;
+    }
+    const cb = $('#task-auto');
+    if (cb) cb.checked = false;
+  }
+
+  function stopTaskSync() {
+    if (taskSyncTimer) {
+      clearInterval(taskSyncTimer);
+      taskSyncTimer = null;
+    }
+    const cb = $('#task-auto-sync');
+    if (cb) cb.checked = false;
+  }
+
+  // 自动同步：只推非终态的任务，且一次最多 5 个 —— 面板的轮询不该变成
+  // 对上游的请求放大（每个任务一次上游往返）。
+  async function syncRunningTasks() {
+    const running = (state.tasks || []).filter((t) => !TASK_TERMINAL.includes(t.status));
+    if (!running.length) return;
+    for (const t of running.slice(0, 5)) {
+      try {
+        await api(`/panel/api/tasks/${encodeURIComponent(t.id)}/sync`, { method: 'POST', body: '{}' });
+      } catch { /* 单个失败不打断整轮，下一轮还会试 */ }
+    }
+    loadTasks();
+  }
+
+  $('#refresh-tasks').addEventListener('click', loadTasks);
+  $('#task-auto').addEventListener('change', (e) => {
+    stopTaskAuto();
+    if (e.currentTarget.checked) taskTimer = setInterval(loadTasks, 3000);
+  });
+  $('#task-auto-sync').addEventListener('change', (e) => {
+    stopTaskSync();
+    if (e.currentTarget.checked) {
+      syncRunningTasks();
+      taskSyncTimer = setInterval(syncRunningTasks, 15000);
+    }
+  });
+
+  // ---------- 签到 ----------
+
+  const SIGNIN_STATE = {
+    1: ['未到', 'badge'],
+    2: ['可领', 'badge accent'],
+    3: ['已领', 'badge ok'],
+  };
+
+  async function loadSignin() {
+    try {
+      const d = await api('/panel/api/signin');
+      renderSignin(d);
+    } catch (err) {
+      if (err.status === 401) return showGate();
+      toast(err.message, true);
+    }
+  }
+
+  function renderSignin(d) {
+    const s = d.summary || {};
+
+    $('#signin-auto').checked = !!d.auto;
+    $('#signin-at').value = d.at || '';
+    $('#signin-auto-note').textContent = d.auto
+      ? `每天 ${d.at}（${d.timezone || 'Asia/Shanghai'}）自动签，进程内定时器`
+      : '自动签到已关闭';
+
+    const box = $('#signin-stats');
+    box.textContent = '';
+    const items = [
+      { k: '账号', v: String(s.accounts || 0), s: `${s.claimed || 0} 个本次新领` },
+      { k: '本次积分', v: String(s.points || 0), s: '签到积分 30 天有效' },
+      { k: '连续天数', v: s.day_no ? '第 ' + s.day_no + ' 天' : '—', s: '满 7 天一轮，4000 分' },
+      { k: '失败', v: String(s.failed || 0), s: '失败的号不影响其他号' },
+    ];
+    for (const it of items) {
+      const card = el('div', 'stat');
+      card.appendChild(el('div', 'k', it.k));
+      card.appendChild(el('div', 'v', it.v));
+      card.appendChild(el('div', 's', it.s));
+      box.appendChild(card);
+    }
+
+    const wrap = $('#signin-body');
+    wrap.textContent = '';
+    const list = d.results || [];
+    if (!list.length) {
+      wrap.appendChild(el('div', 'empty', '还没有账号。先在「账号」页添加。'));
+      return;
+    }
+    const table = el('table');
+    const thead = el('thead');
+    const htr = el('tr');
+    ['状态', '账号', '今天', '本次', '说明'].forEach((h) => htr.appendChild(el('th', '', h)));
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    const tbody = el('tbody');
+    for (const r of list) {
+      const tr = el('tr');
+      const tdOK = el('td');
+      if (r.ok) tdOK.appendChild(el('span', 'badge ok', '正常'));
+      else tdOK.appendChild(el('span', 'badge err', '失败'));
+      tr.appendChild(tdOK);
+
+      const tdName = el('td');
+      tdName.appendChild(el('div', '', r.label || r.account_id));
+      if (r.label && r.label !== r.account_id) tdName.appendChild(el('div', 'muted small mono', r.account_id));
+      tr.appendChild(tdName);
+
+      const tdToday = el('td');
+      const [text, cls] = SIGNIN_STATE[r.today_status] || ['—', 'badge'];
+      tdToday.appendChild(el('span', cls, r.day_no ? `第 ${r.day_no} 天 · ${text}` : text));
+      tr.appendChild(tdToday);
+
+      tr.appendChild(el('td', 'num', r.claimed ? '+' + r.points : '—'));
+
+      const tdMsg = el('td', 'small');
+      if (r.error) {
+        tdMsg.textContent = r.error;
+        tdMsg.style.color = 'var(--err)';
+        tdMsg.style.maxWidth = '320px';
+      } else {
+        tdMsg.textContent = r.claimed ? '已领取' : (r.today_status === 3 ? '今日已签过' : '—');
+        tdMsg.className = 'small muted';
+      }
+      tr.appendChild(tdMsg);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  }
+
+  $('#refresh-signin').addEventListener('click', loadSignin);
+
+  $('#signin-claim').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = '签到中…';
+    try {
+      const d = await api('/panel/api/signin', { method: 'POST', body: '{}' });
+      const s = d.summary || {};
+      if (s.points > 0) toast(`签到成功 +${s.points} 积分`);
+      else if (s.failed > 0) toast(`${s.failed} 个账号签到失败，见详情`, true);
+      else toast('今日已签到');
+      await loadSignin();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '立即签到';
+    }
+  });
+
+  $('#signin-save').addEventListener('click', async () => {
+    const auto = $('#signin-auto').checked;
+    const at = ($('#signin-at').value || '').trim();
+    try {
+      await api('/panel/api/config', {
+        method: 'POST',
+        body: JSON.stringify({ signin_auto: auto, signin_at: at || '00:10' }),
+      });
+      toast('已保存，1 分钟内生效');
+      await loadSignin();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
 
   // ---------- 日志 ----------
 
