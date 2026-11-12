@@ -211,3 +211,25 @@ func TestMediaCapacityErrors(t *testing.T) {
 		}
 	}
 }
+
+// 402 的提示必须跟着上游措辞走：视频是"缺积分"，图片是"窗口限额"。
+// 曾经一律加"不是余额不足"，把视频用户往反方向带。
+func TestBillingHintMatchesUpstream(t *testing.T) {
+	imgMsg := "the user's plan balance has run out; this is a billing limit on the user's own subscription plan"
+	got := billingHint(imgMsg)
+	if !strings.Contains(got, "限额触顶") || !strings.Contains(got, "无需充值") {
+		t.Fatalf("图片口径不对: %s", got)
+	}
+
+	vidMsg := "the configured payment sources have insufficient allowance or credits for this video; this task costs 280 credits"
+	got = billingHint(vidMsg)
+	if !strings.Contains(got, "积分不足") || strings.Contains(got, "不是余额不足") {
+		t.Fatalf("视频口径不对: %s", got)
+	}
+
+	// 认不出来的措辞就别乱加提示。
+	other := "something unexpected"
+	if billingHint(other) != other {
+		t.Fatalf("未知措辞不该被加提示: %s", billingHint(other))
+	}
+}

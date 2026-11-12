@@ -194,9 +194,26 @@ func sniffMime(b []byte, fallback string) string {
 // 上游原文是 "plan balance has run out … need to top up"，但控制台实际显示的是
 // 「5 小时限额 100% / 周限额 10%，按窗口重置」。照抄原文会把运维带向"去充值"，
 // 而真实处置是等窗口重置（或降频）。
+// billingHint 给 402 补一句**与上游口径一致**的提示。
+//
+// 这里踩过一次：早先不区分场景，一律加"这是限额触顶，不是余额不足"。
+// 但视频 402 的原文是 "insufficient allowance or credits … costs 280 credits"，
+// 也就是**真的缺积分**；再加"不是余额不足"等于把用户往反方向带。
+// 所以按上游措辞分流，绝不覆盖它本来的判断。
 func billingHint(msg string) string {
-	return msg + "【提示】这是账号的 5 小时/周限额触顶，不是余额不足；" +
-		"额度按窗口重置，重置后自动恢复（控制台可看剩余重置时间）"
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "plan balance"):
+		// 图片/语音这类：控制台显示的是 5 小时/周窗口额度，按窗口重置。
+		return msg + "【提示】这是账号的 5 小时/周限额触顶，额度按窗口重置后自动恢复" +
+			"（控制台可看剩余重置时间），无需充值"
+	case strings.Contains(low, "credit"):
+		// 视频这类：按 credits 计费，积分池为空就只能补积分（或等周额度折算）。
+		return msg + "【提示】这是积分不足：视频按 credits 计费（Hailuo 6s/720p = 280 credits），" +
+			"需补充积分或等周额度重置"
+	default:
+		return msg
+	}
 }
 
 // logMedia 记一条媒体请求日志（含来源 IP/UA）。
