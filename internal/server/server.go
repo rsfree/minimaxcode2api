@@ -28,7 +28,7 @@ import (
 )
 
 // Version 网关版本。
-const Version = "0.2.3"
+const Version = "0.3.0"
 
 // Server 网关主对象。
 type Server struct {
@@ -109,6 +109,7 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/models/{id}", s.auth(s.handleModel))
 	s.Mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.Mux.HandleFunc("GET /status", s.auth(s.handleStatus))
+	s.Mux.HandleFunc("POST /signin", s.auth(s.handleSignin))
 	s.Mux.HandleFunc("OPTIONS /", s.handleOptions)
 	// 兜底：没有匹配到任何路由时自己回 JSON 404。
 	// 不注册它的话，Go 的 ServeMux 会因为 "OPTIONS /" 是唯一能匹配的 pattern

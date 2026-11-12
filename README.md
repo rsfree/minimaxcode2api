@@ -20,7 +20,7 @@
 | 上游地址 | `POST https://agent.minimax.cn/mavis/api/v1/llm/v1/messages` |
 | 协议 | **Anthropic Messages**（不是 OpenAI，也不需要中转转换） |
 | 鉴权 | 只需 `Authorization: Bearer mmoat_…` + `anthropic-version: 2023-06-01` |
-| 签名 | **不需要**。`x-signature = md5(timestamp + 固定盐 + body)` 只作用于 `/matrix`、`/minimax-cloud` 等业务接口，LLM 通道不校验 |
+| 签名 | **不需要**。`x-signature = md5(timestamp + 固定盐 + body)` 只作用于 `/matrix` 业务接口；LLM 通道、媒体网关 `/mavis/api/v1/mcp/*`、`/minimax-cloud/api/v1/*`（免费额度、签到）实测都只要 Bearer |
 | 客户端指纹 | 无 `device_id`/`yy`/`params.client` 之类要求，UA 对齐官方即可 |
 | 证书固定 | 主进程无 `setCertificateVerifyProc`/pinning，可直接抓包 |
 | 模型 | `MiniMax-M3.1-Flash`（思考**强制开启**，传 `thinking` 会 400）、`MiniMax-M3`（可开关） |
@@ -92,6 +92,7 @@ docker compose up -d --build
 | `GET /v1/models` / `GET /v1/models/{id}` | 模型列表与详情 |
 | `GET /healthz` | 健康检查（免鉴权） |
 | `GET /status` | 运行状态（鉴权） |
+| `POST /signin` | 账号池全员每日签到（鉴权），见《[每日签到](#每日签到)》 |
 | `GET /panel/` | Web 管理台 |
 
 鉴权：`Authorization: Bearer <api_key>` 或 `x-api-key: <api_key>`。
@@ -190,6 +191,45 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 - **设置**：调度策略、超时、默认模型、面板口令等白名单热改
 
 界面无框架、无外部字体/CDN，`script-src 'self'` 严格 CSP，所有文本走 `textContent`。
+
+## 每日签到
+
+`POST /signin` 给池里每个账号签一次到。积分归账号自己，网关不记账也不落库；
+鉴权与 `/v1/*` 相同（`Authorization: Bearer <api_key>`）。
+
+```json
+{"ok":true,"timezone":"Asia/Shanghai","total_points":400,
+ "results":[{"account_id":"…","label":"…","ok":true,"claimed":true,
+             "day_no":2,"points":400,"today_status":3}]}
+```
+
+上游面板是**两步语义**（2026-11-12 实测）：
+
+| `today_status` | 含义 | 网关动作 |
+|---|---|---|
+| `1` | 还没到这一天 | 只读，不领 |
+| `2` | 今日可领 | `POST /signin/claim` |
+| `3` | 已领取 | 只读，不领（`claimed=false` 但 `ok=true`） |
+
+所以这个端点是**幂等**的：一天调几次都只有第一次真领，后面如实返回「已签」。
+自动化直接天天打即可，不需要自己判断日期。
+
+几条容易踩的：
+
+- **时区决定「今天」**（`signin.timezone`，默认 `Asia/Shanghai`）。上游按
+  `timezone_id` 切日，传错会在跨零点时出现「昨天能领、今天不能」的错觉。
+- **单号失败不拖垮整批**：`ok` 是汇总值，`results[].error` 给原因；
+  坏号（401）不会影响其他号领取。
+- **禁用账号也签**：停用只是不参与调度，积分照拿。
+- 签到积分 30 天有效，一周满签 4000（400/天，第 4、7 天各 1000）。
+
+服务器上可以挂 cron（key 已经在 `.env` 里）：
+
+```bash
+5 0 * * * . /opt/minimaxcode2api/.env && curl -s -X POST \
+  -H "Authorization: Bearer $MMX2A_API_KEY" https://minimaxcode.1task.cn/signin \
+  >> /var/log/mmx2a-signin.log 2>&1
+```
 
 ## 媒体接口（图片 / 视频 / 语音）
 

@@ -115,6 +115,18 @@ type Logging struct {
 	CaptureClientInfo bool `json:"capture_client_info"`
 }
 
+// Signin 每日签到。
+//
+// 时区决定「今天」是哪一天：上游按 timezone_id 切日，传错会在跨零点时
+// 出现「明明签过却还能再领」或「一直不可签」。国内账号固定用 Asia/Shanghai。
+type Signin struct {
+	// Timezone IANA 时区名，默认 Asia/Shanghai。
+	Timezone string `json:"timezone"`
+	// CloudBase 云服务基址（到 /api/v1 为止）。留空则由 upstream.base_url
+	// 的 origin 推导：https://agent.minimax.cn/minimax-cloud/api/v1
+	CloudBase string `json:"cloud_base"`
+}
+
 type Config struct {
 	Listen string `json:"listen"`
 	// APIKey 对外 /v1/* 的密钥；也用作面板登录口令（除非单独设置 AdminPassword）。
@@ -135,6 +147,7 @@ type Config struct {
 	Defaults Defaults `json:"defaults"`
 	Models   Models   `json:"models"`
 	Logging  Logging  `json:"logging"`
+	Signin   Signin   `json:"signin"`
 
 	// 运行时字段，不写回文件。
 	path string
@@ -193,6 +206,9 @@ func Default() *Config {
 			RequestRetentionDays:  7,
 			MaxEntries:            2000,
 			CaptureClientInfo:     true,
+		},
+		Signin: Signin{
+			Timezone: "Asia/Shanghai",
 		},
 	}
 }
@@ -378,6 +394,9 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Pool.RefreshBefore <= 0 {
 		c.Pool.RefreshBefore = d.Pool.RefreshBefore
+	}
+	if c.Signin.Timezone == "" {
+		c.Signin.Timezone = d.Signin.Timezone
 	}
 	if c.Defaults.Model == "" {
 		c.Defaults.Model = d.Defaults.Model

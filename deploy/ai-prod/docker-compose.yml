@@ -1,13 +1,13 @@
 # minimaxcode2api @ ai-prod（210.121.44.245）
 #
 # 部署方式：服务器构建（GHCR 上没有镜像，仓库也没有 Actions 流水线）。
-# 构建：cd /opt/minimaxcode2api/src && docker build -t minimaxcode2api:0.2.3 .
+# 构建：cd /opt/minimaxcode2api/src && docker build -t minimaxcode2api:0.3.0 .
 # 起服务：cd /opt/minimaxcode2api && docker compose up -d
 #
 # 密钥不写在文件里：同目录 .env（chmod 600）提供 MMX2A_API_KEY / MMX2A_ADMIN_PASSWORD。
 services:
   minimaxcode2api:
-    image: minimaxcode2api:0.2.3
+    image: minimaxcode2api:0.3.0
     container_name: minimaxcode2api
     restart: unless-stopped
 
