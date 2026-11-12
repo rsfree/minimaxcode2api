@@ -141,14 +141,23 @@ check("B 鉴权", "/status 带 key 200", st == 200, f"HTTP {st}")
 
 # ---------------- C. 模型 ----------------
 st, _, d, _ = call("GET", "/v1/models", headers=AUTH)
-ids = [m["id"] for m in d.get("data", [])]
-check("C 模型", "模型列表内容", ids == ["MiniMax-M3.1-Flash", "MiniMax-M3"], str(ids))
+kinds = {m["id"]: m.get("type") for m in d.get("data", [])}
+check("C 模型", "清单含对话/图片/视频三类", kinds == {
+    "MiniMax-M3.1-Flash": "chat", "MiniMax-M3": "chat",
+    "MiniMax-Image": "image",
+    "MiniMax-H3": "video", "MiniMax-Hailuo-2.3": "video",
+}, str(kinds))
 st, _, d, _ = call("GET", "/v1/models/M3", headers=AUTH)
 check("C 模型", "别名 /v1/models/M3", st == 200 and d.get("id") == "MiniMax-M3", f"HTTP {st} id={d.get('id')}")
 st, _, d, _ = call("GET", "/v1/models/m3.1-flash", headers=AUTH)
 check("C 模型", "别名 /v1/models/m3.1-flash", st == 200 and d.get("id") == "MiniMax-M3.1-Flash", f"HTTP {st} id={d.get('id')}")
 st, _, d, _ = call("GET", "/v1/models/gpt-4o", headers=AUTH)
 check("C 模型", "未知模型 404", st == 404 and err_code(d) == "model_not_found", f"HTTP {st} code={err_code(d)}")
+st, _, d, _ = call("GET", "/v1/models/h3", headers=AUTH)
+check("C 模型", "视频别名 /v1/models/h3", st == 200 and d.get("id") == "MiniMax-H3" and d.get("type") == "video",
+      f"HTTP {st} id={d.get('id')} type={d.get('type')}")
+expect_err("C 模型", "视频模型发对话入口 → 400 指路", "/v1/chat/completions",
+           {"model": "h3", "messages": [{"role": "user", "content": "hi"}]}, 400, "invalid_request", AUTH)
 
 # ---------------- D. chat 校验 ----------------
 expect_err("D chat", "坏 JSON → 400 invalid_json", "/v1/chat/completions", b"{bad", 400, "invalid_json", AUTH)

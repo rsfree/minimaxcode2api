@@ -17,6 +17,7 @@ import (
 
 	"github.com/linguo2625469/minimaxcode2api/internal/config"
 	"github.com/linguo2625469/minimaxcode2api/internal/convert"
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 	"github.com/linguo2625469/minimaxcode2api/internal/oauth"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 	"github.com/linguo2625469/minimaxcode2api/internal/quota"
@@ -604,22 +605,43 @@ func (p *Panel) logs(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	cfg := p.d.Cfg.Load()
 	type mv struct {
-		ID        string `json:"id"`
-		Context   int    `json:"context_window"`
-		MaxOutput int    `json:"max_output"`
-		Thinking  string `json:"thinking"`
+		ID        string   `json:"id"`
+		Type      string   `json:"type"`
+		Context   int      `json:"context_window"`
+		MaxOutput int      `json:"max_output"`
+		Thinking  string   `json:"thinking"`
+		Aliases   []string `json:"aliases,omitempty"`
 	}
+	// 与 /v1/models 同源：面板上看到的就是客户端能看到的能力面。
+	// 面板不复刻一份清单 —— 曾经两边各写一遍，加模型时必然漏改一边。
 	var out []mv
 	seen := map[string]bool{}
-	ids := append([]string{}, cfg.Models.Expose...)
-	ids = append(ids, convert.KnownModels()...)
-	for _, id := range ids {
+	add := func(id string, info modelcat.Info, known bool) {
 		if id == "" || seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
-		cap, _ := convert.CapabilityOf(id)
-		out = append(out, mv{ID: id, Context: cap.ContextWindow, MaxOutput: cap.MaxOutput, Thinking: cap.Thinking})
+		v := mv{ID: id, Type: modelcat.Chat}
+		if known {
+			v.Type = info.Kind
+			v.Aliases = info.Aliases
+			if info.Kind == modelcat.Chat {
+				v.Context = info.ContextWindow
+				v.MaxOutput = info.MaxOutput
+				v.Thinking = info.Thinking
+			}
+		}
+		out = append(out, v)
+	}
+	for _, id := range cfg.Models.Expose {
+		info, known := modelcat.Lookup(id)
+		if known {
+			id = info.ID // 别把别名当独立模型列出来
+		}
+		add(id, info, known)
+	}
+	for _, info := range modelcat.All() {
+		add(info.ID, info, true)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"models":     out,

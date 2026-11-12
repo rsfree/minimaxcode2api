@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/convert"
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 	"github.com/linguo2625469/minimaxcode2api/internal/reqlog"
 )
 
@@ -50,6 +51,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	model := s.resolveModel(probe.Model)
+	// 与 OpenAI 入口同一套闸门：图片/视频模型发到对话入口一律 400 指路。
+	if kind := s.kindOf(model); kind != modelcat.Chat {
+		entry.Status = http.StatusBadRequest
+		entry.Error = misrouteMessage(model, kind)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", entry.Error)
+		return
+	}
 	entry.Model = model
 	entry.Stream = probe.Stream
 

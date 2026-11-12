@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/convert"
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 	"github.com/linguo2625469/minimaxcode2api/internal/reqlog"
 	"github.com/linguo2625469/minimaxcode2api/internal/upstream"
 )
@@ -61,6 +62,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		entry.Status = http.StatusNotFound
 		entry.Error = "模型已隐藏: " + model
 		writeOpenAIError(w, http.StatusNotFound, "model_not_found", entry.Error)
+		return
+	}
+	// 清单里同时有图片/视频模型，发错入口就直接指路，不要透传给上游。
+	if kind := s.kindOf(model); kind != modelcat.Chat {
+		entry.Status = http.StatusBadRequest
+		entry.Error = misrouteMessage(model, kind)
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", entry.Error)
 		return
 	}
 	entry.Model = model

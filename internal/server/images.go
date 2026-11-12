@@ -11,6 +11,7 @@ import (
 
 	"github.com/linguo2625469/minimaxcode2api/internal/imageproto"
 	"github.com/linguo2625469/minimaxcode2api/internal/media"
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 )
 
 // 图片接口按 OpenAI 图像协议的 canonical 契约实现：
@@ -56,6 +57,19 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req, perr := imageproto.Decode(raw)
+	// model 只做类别校验：上游 image_synthesize **没有 model 参数**（见 README），
+	// 带不带它的差别只是"客户端以为自己在选模型"。但对话/视频模型发到这里是实打实的
+	// 配置错误，直接 400 指路；清单外的未知写法保持放行 —— 生态里不少客户端会写死
+	// dall-e-3 / gpt-image-1，为一个装饰字段拒绝请求不值得。
+	if perr == nil {
+		if info, ok := modelcat.Lookup(req.Model); ok && info.Kind != modelcat.Image {
+			perr = &imageproto.ProtocolError{
+				Status: http.StatusBadRequest, Type: "invalid_request_error",
+				Param: "model", Code: "invalid_model",
+				Message: misrouteMessage(req.Model, info.Kind),
+			}
+		}
+	}
 	if perr == nil {
 		var payload map[string]any
 		var warnings []string

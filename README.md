@@ -89,7 +89,7 @@ docker compose up -d --build
 | `POST /v1/chat/completions` | OpenAI 兼容（含 `stream` / `tools` / `tool_choice` / `reasoning_effort` / 图片输入） |
 | `POST /v1/messages` | Anthropic 原生直通（`thinking`、`cache_control`、`tool_use` 全部原样保留） |
 | `POST /v1/messages/count_tokens` | 本地估算（上游该端点返回 405） |
-| `GET /v1/models` / `GET /v1/models/{id}` | 模型列表与详情 |
+| `GET /v1/models` / `GET /v1/models/{id}` | 模型列表与详情（对话 / 图片 / 视频三类，带 `type`） |
 | `GET /healthz` | 健康检查（免鉴权） |
 | `GET /status` | 运行状态（鉴权） |
 | `POST /signin` | 账号池全员每日签到（鉴权），见《[每日签到](#每日签到)》 |
@@ -117,7 +117,37 @@ export ANTHROPIC_AUTH_TOKEN=sk-mmx-…
 export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 ```
 
-模型别名：`M3` / `minimax-m3` → `MiniMax-M3`，`M3.1-Flash` / `MiniMax-M3.1` / `m3.1-flash` → `MiniMax-M3.1-Flash`。
+### 模型清单（`GET /v1/models`）
+
+清单是**能力发现面**：每条都带 `type`，客户端据此决定发往哪个端点。只列对话模型时，
+图片/视频能力在选择器里根本不存在；列了却不带类别，客户端又会把视频模型发给
+`/v1/chat/completions`。
+
+| id | type | 端点 | 别名 |
+|---|---|---|---|
+| `MiniMax-M3.1-Flash` | `chat` | `POST /v1/chat/completions`、`POST /v1/messages` | `M3.1-Flash` `m3.1-flash` `MiniMax-M3.1` |
+| `MiniMax-M3` | `chat` | 同上 | `M3` `minimax-m3` |
+| `MiniMax-Image` | `image` | `POST /v1/images/generations` | `image` `h3-image` `image-01` |
+| `MiniMax-H3` | `video` | `POST /v1/contents/generations/tasks` | `h3` `h3-max` `minimax-h3-max` |
+| `MiniMax-Hailuo-2.3` | `video` | 同上 | `h2.3` `hailuo` `hailuo-2.3` `minimax-hailuo-23` |
+
+对话模型额外带 `context_window` / `max_output` / `reasoning`；媒体模型不带这些字段
+（没有 token 概念，带上只会让客户端误判它能吃 `messages`）。别名在 `/v1/models/{id}`
+里也认，大小写不敏感。
+
+> `MiniMax-Image` 是**能力标签**，不是上游型号：上游 `image_synthesize` 没有 `model`
+> 参数（见《[图片接口](#图片接口openai-图像协议)》）。列它只为让客户端能把「图片」
+> 配成一个可选的 model id。图片请求里写别的未知 model 也照常放行 —— 那个字段不生效，
+> 不值得为它拒绝请求。视频不同：`model` 决定计费与能力（H3 才有全模态参考），
+> 所以只认上面两个。
+
+模型发错端点会直接 `400` 指路，而不是透传给上游换来一句参数错误：
+
+```json
+{"error":{"type":"invalid_request_error","code":"invalid_request",
+ "message":"模型 MiniMax-H3 是视频模型，请改用 POST /v1/contents/generations/tasks"}}
+```
+
 
 图片、视频、语音的路由见《[媒体接口](#媒体接口图片--视频--语音)》。
 

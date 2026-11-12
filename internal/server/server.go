@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/config"
-	"github.com/linguo2625469/minimaxcode2api/internal/convert"
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 	"github.com/linguo2625469/minimaxcode2api/internal/oauth"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 	"github.com/linguo2625469/minimaxcode2api/internal/quota"
@@ -29,7 +29,7 @@ import (
 )
 
 // Version 网关版本。
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 // Server 网关主对象。
 type Server struct {
@@ -244,6 +244,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveModel 把别名解析成上游真实模型名。
+//
+// 三处来源的优先级：配置别名（运维显式指定）> 内置清单（含图片/视频的 id 与别名）
+// > models.expose 里用户自加的模型（只做大小写归一）。内置清单必须在这里也能命中，
+// 否则 /v1/models 里列出的 id 拿回来反而解析不了。
 func (s *Server) resolveModel(name string) string {
 	cfg := s.Cfg.Load()
 	name = strings.TrimSpace(name)
@@ -259,12 +263,52 @@ func (s *Server) resolveModel(name string) string {
 			return v
 		}
 	}
-	for _, m := range append(cfg.Models.Expose, convert.KnownModels()...) {
+	if info, ok := modelcat.Lookup(name); ok {
+		return info.ID
+	}
+	for _, m := range cfg.Models.Expose {
 		if strings.EqualFold(m, name) {
 			return m
 		}
 	}
 	return name
+}
+
+// kindOf 返回模型类别。清单外的模型（运维在 models.expose 里自加的）按 chat 处理 ——
+// 这是历史语义：expose 一直是"往对话清单里加模型"的开关。
+func (s *Server) kindOf(model string) string {
+	if kind, ok := modelcat.KindOf(model); ok {
+		return kind
+	}
+	return modelcat.Chat
+}
+
+// endpointFor 给出某类模型的正确入口，用于错路由时指路。
+func endpointFor(kind string) string {
+	switch kind {
+	case modelcat.Image:
+		return "POST /v1/images/generations"
+	case modelcat.Video:
+		return "POST /v1/contents/generations/tasks"
+	default:
+		return "POST /v1/chat/completions"
+	}
+}
+
+// misrouteMessage 是「模型发错端点」的统一话术。
+//
+// 为什么值得单独一句话：/v1/models 现在同时列对话/图片/视频，客户端把一个视频
+// 模型发给 /v1/chat/completions 是配置问题的常见形态；上游只会回"参数不合法"，
+// 而真正的答案是"换入口"。错路由一律 400 而不是透传上游。
+func misrouteMessage(model, kind string) string {
+	label := "对话"
+	switch kind {
+	case modelcat.Image:
+		label = "图片"
+	case modelcat.Video:
+		label = "视频"
+	}
+	return "模型 " + model + " 是" + label + "模型，请改用 " + endpointFor(kind)
 }
 
 func (s *Server) isHidden(model string) bool {
@@ -281,35 +325,54 @@ type modelObject struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
-	// 扩展字段，方便客户端识别能力。
-	ContextWindow int  `json:"context_window,omitempty"`
-	MaxOutput     int  `json:"max_output,omitempty"`
-	Reasoning     bool `json:"reasoning,omitempty"`
+	// Type 是能力类别（chat / image / video）：客户端据此决定发往哪个端点。
+	// 不带它的时候，客户端只能假设"全都是对话模型"，图片/视频模型就被发错入口。
+	Type string `json:"type"`
+	// 以下为对话模型的扩展字段，媒体模型不带。
+	ContextWindow int      `json:"context_window,omitempty"`
+	MaxOutput     int      `json:"max_output,omitempty"`
+	Reasoning     bool     `json:"reasoning,omitempty"`
+	Aliases       []string `json:"aliases,omitempty"`
 }
 
+// modelList 组装对外清单：运维自加的 expose（默认按 chat）+ 内置清单（含图片/视频）。
+//
+// 顺序上 expose 在前：运维把这些模型写进配置，往往就是希望它们排在选择器前面。
 func (s *Server) modelList() []modelObject {
 	cfg := s.Cfg.Load()
 	seen := map[string]bool{}
 	var out []modelObject
-	add := func(id string) {
+
+	add := func(id string, info modelcat.Info, known bool) {
 		if id == "" || seen[id] || s.isHidden(id) {
 			return
 		}
 		seen[id] = true
-		cap, known := convert.CapabilityOf(id)
-		m := modelObject{ID: id, Object: "model", Created: 1735689600, OwnedBy: "minimax"}
+		m := modelObject{ID: id, Object: "model", Created: 1735689600, OwnedBy: "minimax",
+			Type: modelcat.Chat}
 		if known {
-			m.ContextWindow = cap.ContextWindow
-			m.MaxOutput = cap.MaxOutput
-			m.Reasoning = true
+			m.Type = info.Kind
+			m.Aliases = info.Aliases
+			if info.Kind == modelcat.Chat {
+				m.ContextWindow = info.ContextWindow
+				m.MaxOutput = info.MaxOutput
+				m.Reasoning = true
+			}
 		}
 		out = append(out, m)
 	}
+
 	for _, id := range cfg.Models.Expose {
-		add(id)
+		info, known := modelcat.Lookup(id)
+		if known {
+			// expose 里写了别名（如 M3）时列 id，否则清单里会出现
+			// 一个"看起来是模型、实际只是别名"的条目。
+			id = info.ID
+		}
+		add(id, info, known)
 	}
-	for _, id := range convert.KnownModels() {
-		add(id)
+	for _, info := range modelcat.All() {
+		add(info.ID, info, true)
 	}
 	return out
 }

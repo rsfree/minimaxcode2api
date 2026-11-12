@@ -603,20 +603,37 @@
       const table = el('table');
       const thead = el('thead');
       const htr = el('tr');
-      ['模型', '上下文', '最大输出', '思考', '默认'].forEach((h) => htr.appendChild(el('th', '', h)));
+      ['模型', '类型', '上下文', '最大输出', '思考', '默认'].forEach((h) => htr.appendChild(el('th', '', h)));
       thead.appendChild(htr);
       table.appendChild(thead);
 
+      // 类别与端点一一对应：徽章表达的是"该发哪个接口"，不是"好坏"。
+      const KIND = {
+        chat: ['对话', 'badge ok'],
+        image: ['图片', 'badge accent'],
+        video: ['视频', 'badge'],
+      };
       const tbody = el('tbody');
       for (const m of d.models || []) {
         const tr = el('tr');
-        tr.appendChild(el('td', 'mono', m.id));
-        tr.appendChild(el('td', 'num', fmtNum(m.context_window || 0)));
-        tr.appendChild(el('td', 'num', fmtNum(m.max_output || 0)));
+        const tdID = el('td', 'mono nowrap', m.id);
+        if (m.aliases && m.aliases.length) {
+          tdID.appendChild(el('div', 'muted small nowrap', '别名 ' + m.aliases.join(' / ')));
+        }
+        tr.appendChild(tdID);
+
+        const tdKind = el('td');
+        const kind = KIND[m.type] || KIND.chat;
+        tdKind.appendChild(el('span', kind[1], kind[0]));
+        tr.appendChild(tdKind);
+
+        // 媒体模型没有上下文/思考这些概念，用「—」而不是 0 或"未知"。
+        tr.appendChild(el('td', 'num', m.context_window ? fmtNum(m.context_window) : '—'));
+        tr.appendChild(el('td', 'num', m.max_output ? fmtNum(m.max_output) : '—'));
         const tdThink = el('td');
         if (m.thinking === 'forced_adaptive') tdThink.appendChild(el('span', 'badge warn', '强制自适应'));
         else if (m.thinking === 'switchable') tdThink.appendChild(el('span', 'badge ok', '可开关'));
-        else tdThink.appendChild(el('span', 'badge', '未知'));
+        else tdThink.textContent = '—';
         tr.appendChild(tdThink);
         const tdDef = el('td');
         if (m.id === d.default) tdDef.appendChild(el('span', 'badge accent', '默认'));

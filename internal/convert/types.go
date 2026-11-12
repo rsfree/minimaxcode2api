@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
 )
 
 // ---------- Anthropic 形态 ----------
@@ -229,19 +231,22 @@ type ModelCapability struct {
 	ContextWindow int
 }
 
-var modelCaps = map[string]ModelCapability{
-	"MiniMax-M3.1-Flash": {Thinking: "forced_adaptive", MaxOutput: 128000, ContextWindow: 512000},
-	"MiniMax-M3":         {Thinking: "switchable", MaxOutput: 128000, ContextWindow: 512000},
-}
-
-// CapabilityOf 返回模型能力；未知模型按"不要碰 thinking"处理。
+// CapabilityOf 返回**对话模型**的能力；未知模型与非对话模型一律 ok=false，
+// 按"不要碰 thinking"处理。
+//
+// 真源在 modelcat：这里只是把「清单」投影成「转换器要的三个字段」。曾经这份表
+// 独立维护过一遍，加模型时漏改一处就会让 thinking 策略静默失效。
 func CapabilityOf(model string) (ModelCapability, bool) {
-	c, ok := modelCaps[model]
-	return c, ok
+	info, ok := modelcat.ByID(model)
+	if !ok || info.Kind != modelcat.Chat {
+		return ModelCapability{}, false
+	}
+	return ModelCapability{
+		Thinking:      info.Thinking,
+		MaxOutput:     info.MaxOutput,
+		ContextWindow: info.ContextWindow,
+	}, true
 }
-
-// KnownModels 内置模型清单（面板与 /v1/models 兜底用）。
-func KnownModels() []string { return []string{"MiniMax-M3.1-Flash", "MiniMax-M3"} }
 
 // ---------- 请求转换 ----------
 
