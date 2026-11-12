@@ -8,7 +8,6 @@
 package config
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -237,9 +236,8 @@ func Load(path string) (*Config, error) {
 		cfg.applyEnv()
 		cfg.ApplyRegionPreset()
 		cfg.fillDefaults()
-		// Auto 的零值是 false："没写过 signin 段"（升级前的老配置）应默认开启，
-		// 而显式写了 "auto": false 必须尊重 —— 所以只能看原始 JSON 有没有这个键。
-		if !bytes.Contains(raw, []byte(`"signin"`)) {
+		// Auto 的零值是 false："没写过"和"明确关掉"必须区分，否则升级即失效。
+		if !signinAutoSet(raw) {
 			cfg.Signin.Auto = true
 		}
 		return cfg, nil
@@ -498,3 +496,20 @@ func NewHolder(c *Config) *Holder {
 func (h *Holder) Load() *Config { return h.ptr.Load() }
 
 func (h *Holder) Store(c *Config) { h.ptr.Store(c) }
+
+// signinAutoSet 判断原始配置里是否真的写过 signin.auto。
+//
+// 只看有没有 "signin" 段不够：0.3.x 只要在面板保存过一次配置（哪怕改的是
+// 别的字段），就会把整个 signin 段落盘成 {"timezone":"","cloud_base":""} ——
+// 没有 auto 键。那之后升级到 0.4 会被误判成「用户明确关了自动签到」，
+// 自动化静默失效，而且面板上还显示"已关闭"，看起来像是自己关的。
+func signinAutoSet(raw []byte) bool {
+	var probe struct {
+		Signin map[string]json.RawMessage `json:"signin"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	_, ok := probe.Signin["auto"]
+	return ok
+}
