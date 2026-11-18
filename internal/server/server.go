@@ -29,7 +29,7 @@ import (
 )
 
 // Version 网关版本。
-const Version = "0.5.0"
+const Version = "0.5.1"
 
 // Server 网关主对象。
 type Server struct {
