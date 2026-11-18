@@ -67,6 +67,9 @@
       <a href="#/logs" data-view="logs">
         <span class="ico">≡</span>请求日志
       </a>
+      <a href="#/probes" data-view="probes">
+        <span class="ico">▦</span>实测
+      </a>
       <a href="#/settings" data-view="settings">
         <span class="ico">⚙</span>设置
       </a>
@@ -201,6 +204,27 @@
         </div>
       </header>
       <div class="card"><div id="logs-body" class="table-wrap"></div></div>
+    </section>
+
+    <!-- 实测档案 -->
+    <section id="view-probes" class="view">
+      <header class="page-head">
+        <div>
+          <h2>实测档案</h2>
+          <p class="muted">模型、配额、频控与协议验证记录（只读）</p>
+        </div>
+        <div class="head-actions">
+          <button id="refresh-probes" class="btn">刷新</button>
+        </div>
+      </header>
+      <div class="card" id="probes-summary-card" hidden>
+        <div class="card-head">
+          <h3>摘要</h3>
+          <span class="muted small" id="probes-time"></span>
+        </div>
+        <p id="probes-summary" class="muted"></p>
+      </div>
+      <div id="probes-body"></div>
     </section>
 
     <!-- 设置 -->

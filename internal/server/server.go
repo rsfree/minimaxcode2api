@@ -28,8 +28,10 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
 )
 
-// Version 网关版本。
-const Version = "0.5.1"
+// Version 网关版本。默认值是本地直接 `go build` / `go run` 时的兜底，
+// 正式发布由 CI 用 -ldflags "-X .../internal/server.Version=<tag>" 覆盖。
+// 必须是 var 而非 const —— const 无法被 ldflags 改写。
+var Version = "0.6.1"
 
 // Server 网关主对象。
 type Server struct {
@@ -58,6 +60,10 @@ type Server struct {
 	Quota      *quota.Client
 	quotaMu    sync.Mutex
 	quotaCache map[string]quotaEntry
+
+	// fetchAllowPrivate 关掉对外出站下载的 SSRF 内网拦截。
+	// 只给测试用（httptest 起在 127.0.0.1），生产永远为零值。
+	fetchAllowPrivate bool
 }
 
 // New 组装服务。
@@ -105,6 +111,15 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
 	// 媒体接口：上游是 /mavis/api/v1/mcp/*，鉴权与文本一致。
 	s.Mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
+	// 图像工具：抠图 / 2× 超分 / 以图搜图。上游是三个独立的 mcp 工具，
+	// 归到 /v1/images 下比平铺到 /v1 根上更容易让人找到。
+	s.Mux.HandleFunc("POST /v1/images/remove-background", s.auth(s.handleRemoveBackground))
+	s.Mux.HandleFunc("POST /v1/images/upscale", s.auth(s.handleUpscale))
+	s.Mux.HandleFunc("POST /v1/images/reverse-search", s.auth(s.handleReverseImageSearch))
+	s.Mux.HandleFunc("POST /v1/images/describe", s.auth(s.handleDescribeImages))
+	// 理解类：视频 / 音频问答（图片的在上面 /v1/images/describe）。
+	s.Mux.HandleFunc("POST /v1/videos/understand", s.auth(s.handleVideosUnderstand))
+	s.Mux.HandleFunc("POST /v1/audio/understand", s.auth(s.handleAudioUnderstand))
 	// 视频走「异步视频生成协议」的 canonical 路径。同时挂 /v1 与 /api/v3：
 	// 前者是本网关的惯例，后者让 Ark SDK 只需改 base_url 就能直接用。
 	for _, prefix := range []string{"/v1", "/api/v3"} {
@@ -114,6 +129,9 @@ func (s *Server) routes() {
 		s.Mux.HandleFunc("GET "+base+"/{id}", s.auth(s.getVideoTask))
 		s.Mux.HandleFunc("DELETE "+base+"/{id}", s.auth(s.deleteVideoTask))
 	}
+	// 同步视频：与异步任务同一套 canonical 请求体，但没有 task_id，
+	// 一次调用直达 output_url（上游自带轮询）。
+	s.Mux.HandleFunc("POST /v1/contents/generations", s.auth(s.syncVideoGeneration))
 	s.Mux.HandleFunc("GET /v1/voices", s.auth(s.handleVoices))
 	s.Mux.HandleFunc("POST /v1/audio/speech", s.auth(s.handleSpeech))
 	s.Mux.HandleFunc("POST /v1/audio/transcriptions", s.auth(s.handleTranscriptions))

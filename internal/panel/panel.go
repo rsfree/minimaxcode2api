@@ -86,6 +86,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/api/accounts/{id}/test", p.authed(p.accountTest))
 	mux.HandleFunc("GET /panel/api/usage", p.authed(p.usageSeries))
 	mux.HandleFunc("GET /panel/api/logs", p.authed(p.logs))
+	mux.HandleFunc("GET /panel/api/probes", p.authed(p.probes))
 	mux.HandleFunc("GET /panel/api/models", p.authed(p.models))
 	mux.HandleFunc("GET /panel/api/config", p.authed(p.getConfig))
 	mux.HandleFunc("POST /panel/api/config", p.authed(p.setConfig))
@@ -158,6 +159,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		},
 		"today":     p.d.Usage.Today(),
 		"all_time":  p.d.Usage.AllTime(),
+		// 媒体调用（图片/视频/音频）按次数单列：它们没有 token，
+		// 并进 today.requests 会让"今日请求"看起来暴涨而 token 不动。
+		"media_today":    p.d.Usage.TodayMedia(),
+		"media_all_time": p.d.Usage.AllTimeMedia(),
 		"models":    cfg.Models.Expose,
 		"base_url":  cfg.Upstream.BaseURL,
 		"listen":    cfg.Listen,
@@ -585,9 +590,11 @@ func (p *Panel) usageSeries(w http.ResponseWriter, r *http.Request) {
 		days = 14
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"today":    p.d.Usage.Today(),
-		"all_time": p.d.Usage.AllTime(),
-		"series":   p.d.Usage.Series(days),
+		"today":          p.d.Usage.Today(),
+		"all_time":       p.d.Usage.AllTime(),
+		"media_today":    p.d.Usage.TodayMedia(),
+		"media_all_time": p.d.Usage.AllTimeMedia(),
+		"series":         p.d.Usage.Series(days),
 	})
 }
 

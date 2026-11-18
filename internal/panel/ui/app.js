@@ -137,7 +137,7 @@
 
   // ---------- 路由 ----------
 
-  const views = ['overview', 'accounts', 'models', 'tasks', 'signin', 'logs', 'settings'];
+  const views = ['overview', 'accounts', 'models', 'tasks', 'signin', 'logs', 'probes', 'settings'];
 
   function navigate(hash, silent) {
     const name = String(hash || '').replace(/^#\/?/, '') || 'overview';
@@ -163,6 +163,7 @@
     if (view === 'tasks') loadTasks();
     if (view === 'signin') loadSignin();
     if (view === 'logs') loadLogs();
+    if (view === 'probes') loadProbes();
     if (view === 'settings') loadConfig();
   }
 
@@ -186,11 +187,15 @@
     box.textContent = '';
     const today = d.today || {};
     const all = d.all_time || {};
+    const mediaToday = d.media_today || {};
+    const mediaAll = d.media_all_time || {};
     const items = [
       { k: '账号', v: `${(d.accounts && d.accounts.enabled) || 0}/${(d.accounts && d.accounts.total) || 0}`, s: ((d.accounts && d.accounts.cooling) || 0) + ' 个冷却中' },
       { k: '今日请求', v: fmtNum(today.requests), s: (today.errors || 0) + ' 次失败' },
       { k: '今日 Token', v: fmtNum((today.prompt_tokens || 0) + (today.output_tokens || 0)), s: `入 ${fmtNum(today.prompt_tokens)} / 出 ${fmtNum(today.output_tokens)}` },
-      { k: '累计请求', v: fmtNum(all.requests), s: `缓存命中 ${fmtNum(all.cached_tokens)} tok` },
+      // 媒体调用没有 token，单独一张卡；否则图片请求会把"今日 Token"拉低而请求数暴涨。
+      { k: '今日媒体', v: fmtNum(mediaToday.requests), s: `图片/视频/音频 · ${mediaToday.errors || 0} 次失败` },
+      { k: '累计请求', v: fmtNum(all.requests), s: `累媒 ${fmtNum(mediaAll.requests)} 次 · 缓存 ${fmtNum(all.cached_tokens)} tok` },
     ];
     for (const it of items) {
       const card = el('div', 'stat');
@@ -292,16 +297,23 @@
       box.appendChild(el('div', 'empty', '暂无用量数据'));
       return;
     }
-    const max = Math.max(1, ...series.map((s) => (s.total && s.total.requests) || 0));
+    // 柱高按「文本请求 + 媒体调用」合计：只看 total.requests 时，
+    // 纯出图的一天会显示成空柱。
+    const sum = (v) => {
+      const t = (v.total && v.total.requests) || 0;
+      const m = (v.media_total && v.media_total.requests) || 0;
+      return { t, m, all: t + m };
+    };
+    const max = Math.max(1, ...series.map((s) => sum(s).all));
     const today = new Date().toISOString().slice(5, 10);
     for (const s of series) {
-      const req = (s.total && s.total.requests) || 0;
+      const { t: req, m: media, all: total } = sum(s);
       const col = el('div', 'bar-col');
       if (s.date && s.date.slice(5) === today) col.classList.add('on');
       const bar = el('div', 'bar');
-      const h = Math.max(2, Math.round((req / max) * 108));
+      const h = Math.max(2, Math.round((total / max) * 108));
       bar.style.height = h + 'px';
-      bar.title = `${s.date}：${req} 次请求`;
+      bar.title = `${s.date}：文本 ${req} 次 · 媒体 ${media} 次`;
       col.appendChild(bar);
       col.appendChild(el('div', 'bar-label', s.date ? s.date.slice(5) : ''));
       box.appendChild(col);
@@ -1032,6 +1044,71 @@
       state.logTimer = setInterval(loadLogs, 3000);
     }
   });
+
+  // ---------- 实测档案 ----------
+
+  async function loadProbes() {
+    try {
+      const d = await api('/panel/api/probes');
+      renderProbes(d);
+    } catch (err) {
+      if (err.status === 401) return showGate();
+      toast(err.message, true);
+    }
+  }
+
+  function renderProbes(d) {
+    const card = $('#probes-summary-card');
+    const time = $('#probes-time');
+    const sum = $('#probes-summary');
+    const body = $('#probes-body');
+    body.textContent = '';
+    sum.textContent = '';
+    if (d && d.summary) {
+      card.hidden = false;
+      time.textContent = d.generated_at || '';
+      sum.textContent = d.summary;
+      sum.style.marginTop = '6px';
+    } else {
+      card.hidden = true;
+    }
+
+    const sections = Array.isArray(d && d.sections) ? d.sections.slice() : [];
+    if (d && d.cost) {
+      sections.push({ title: '测试成本', note: d.cost.note, head: d.cost.head, rows: d.cost.rows });
+    }
+    for (const s of sections) {
+      if (!s || !Array.isArray(s.head) || !Array.isArray(s.rows)) continue;
+      const c = el('div', 'card');
+      const head = el('div', 'card-head');
+      head.appendChild(el('h3', '', s.title || ''));
+      c.appendChild(head);
+      if (s.note) {
+        const p = el('p', 'muted small', s.note);
+        p.style.margin = '-4px 0 10px';
+        c.appendChild(p);
+      }
+      const wrap = el('div', 'table-wrap');
+      const table = el('table');
+      const thead = el('thead');
+      const htr = el('tr');
+      for (const h of s.head) htr.appendChild(el('th', '', h));
+      thead.appendChild(htr);
+      table.appendChild(thead);
+      const tbody = el('tbody');
+      for (const row of s.rows) {
+        const tr = el('tr');
+        for (const cell of row) tr.appendChild(el('td', '', cell));
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      c.appendChild(wrap);
+      body.appendChild(c);
+    }
+  }
+
+  $('#refresh-probes').addEventListener('click', loadProbes);
 
   // ---------- 设置 ----------
 

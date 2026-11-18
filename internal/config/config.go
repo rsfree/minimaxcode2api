@@ -97,6 +97,13 @@ type Defaults struct {
 	MaxTokens int    `json:"max_tokens"`
 	// ThinkingPolicy 决定 M3（可切换思考）默认行为：auto | off | on。
 	ThinkingPolicy string `json:"thinking_policy"`
+	// ImageResolution 是图片请求没写 size/quality/resolution 时的档位：
+	// 1K | 2K | 4K | auto（auto = 不下发，交上游决定）。
+	//
+	// 默认 1K 而不是 4K：上游按张计费，1K 与 4K 同价（实测 115 units），
+	// 但 4K 单张耗时约 4 倍（14s → 57s）。默认值要服务通用交互场景，
+	// 愿意用时间换分辨率的客户端显式写 resolution=4K 即可。
+	ImageResolution string `json:"image_resolution"`
 }
 
 // Models 对外暴露的模型与别名。
@@ -191,9 +198,10 @@ func Default() *Config {
 			RefreshBefore:   Duration(10 * time.Minute),
 		},
 		Defaults: Defaults{
-			Model:          "MiniMax-M3.1-Flash",
-			MaxTokens:      8192,
-			ThinkingPolicy: "auto",
+			Model:           "MiniMax-M3.1-Flash",
+			MaxTokens:       8192,
+			ThinkingPolicy:  "auto",
+			ImageResolution: "1K",
 		},
 		Models: Models{
 			Expose: []string{"MiniMax-M3.1-Flash", "MiniMax-M3"},
@@ -419,6 +427,9 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Defaults.ThinkingPolicy == "" {
 		c.Defaults.ThinkingPolicy = d.Defaults.ThinkingPolicy
+	}
+	if c.Defaults.ImageResolution == "" {
+		c.Defaults.ImageResolution = d.Defaults.ImageResolution
 	}
 	if len(c.Models.Expose) == 0 {
 		c.Models.Expose = d.Models.Expose

@@ -85,6 +85,8 @@ func TestLookup(t *testing.T) {
 	cases := map[string]string{
 		"MiniMax-H3":         "MiniMax-H3",
 		"h3":                 "MiniMax-H3",
+		"MiniMax-H3-Max":     "MiniMax-H3-Max",
+		"h3-max":             "MiniMax-H3-Max",
 		"MINIMAX-HAILUO-2.3": "MiniMax-Hailuo-2.3",
 		"h2.3":               "MiniMax-Hailuo-2.3",
 		"image":              "MiniMax-Image",

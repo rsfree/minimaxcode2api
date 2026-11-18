@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -194,6 +195,9 @@ func sniffMime(b []byte, fallback string) string {
 // 上游原文是 "plan balance has run out … need to top up"，但控制台实际显示的是
 // 「5 小时限额 100% / 周限额 10%，按窗口重置」。照抄原文会把运维带向"去充值"，
 // 而真实处置是等窗口重置（或降频）。
+// creditCostRe 从 402 原文里抠出 "this task costs 229 credits" 的数额。
+var creditCostRe = regexp.MustCompile(`costs?\s+(\d+)\s+credits`)
+
 // billingHint 给 402 补一句**与上游口径一致**的提示。
 //
 // 这里踩过一次：早先不区分场景，一律加"这是限额触顶，不是余额不足"。
@@ -208,9 +212,16 @@ func billingHint(msg string) string {
 		return msg + "【提示】这是账号的 5 小时/周限额触顶，额度按窗口重置后自动恢复" +
 			"（控制台可看剩余重置时间），无需充值"
 	case strings.Contains(low, "credit"):
-		// 视频这类：按 credits 计费，积分池为空就只能补积分（或等周额度折算）。
-		return msg + "【提示】这是积分不足：视频按 credits 计费（Hailuo 6s/720p = 280 credits），" +
-			"需补充积分或等周额度重置"
+		// 视频这类：按 credits 计费。上游 402 原文通常带 "this task costs N credits"，
+		// 直接把 N 摘出来，比塞一个写死的样例价（Hailuo 6s/720p = 280）准 —— 实测
+		// H3-Max 5s/480P 是 229，同一个提示会把人带偏。
+		hint := "【提示】这是积分不足："
+		if m := creditCostRe.FindStringSubmatch(msg); m != nil {
+			hint += "本次任务需 " + m[1] + " credits（上游原文）。"
+		} else {
+			hint += "视频按 credits 计费。"
+		}
+		return msg + hint + "请补充积分，或确认套餐档位是否覆盖该型号"
 	default:
 		return msg
 	}
@@ -221,6 +232,27 @@ func (s *Server) logMedia(r *http.Request, model string, status int, start time.
 	e := reqlogEntry(r, model, status, start, err)
 	e.ClientIP, e.UA = s.clientInfo(r)
 	s.Logs.Add(e)
+	// 媒体调用同时进用量统计（次数口径）。以前只写 reqlog，面板用量页
+	// 看不到图片/视频，用户会以为网关没统计。
+	if s.Usage != nil {
+		s.Usage.RecordMedia(firstNonEmptyStr(model, mediaKind(r.URL.Path)),
+			time.Since(start), status >= http.StatusBadRequest)
+		s.markUsageDirty()
+	}
+}
+
+// mediaKind 在 model 缺失时按路径归类，保证失败调用也有可读的桶名。
+func mediaKind(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/v1/images"):
+		return "image"
+	case strings.HasPrefix(path, "/v1/videos"), strings.HasPrefix(path, "/v1/contents"):
+		return "video"
+	case strings.HasPrefix(path, "/v1/audio"):
+		return "audio"
+	default:
+		return "media"
+	}
 }
 
 // reqlogEntry 组一条媒体请求日志。

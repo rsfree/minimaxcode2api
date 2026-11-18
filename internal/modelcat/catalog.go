@@ -56,7 +56,14 @@ var catalog = []Info{
 	},
 	{
 		ID: "MiniMax-H3", Kind: Video,
-		Aliases: []string{"h3", "h3-max", "minimax-h3-max"},
+		Aliases: []string{"h3", "minimax-h3"},
+	},
+	{
+		// 与 H3 是两个不同的上游型号（不是同一模型的档位）：Max 是快出片变体，
+		// 只支持 480P/768P、只能文生 + 首尾帧，duration 5-15。别名必须与 H3
+		// 彻底分开 —— 早先把 h3-max 挂在 H3 上，等于把"要快"的请求静默换成"要质量"。
+		ID: "MiniMax-H3-Max", Kind: Video,
+		Aliases: []string{"h3-max", "minimax-h3-max-fast"},
 	},
 	{
 		ID: "MiniMax-Hailuo-2.3", Kind: Video,

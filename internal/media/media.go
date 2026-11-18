@@ -3,8 +3,10 @@
 // 文本走 /mavis/api/v1/llm/v1/messages（Anthropic Messages 协议），媒体走
 // /mavis/api/v1/mcp/<tool> —— 是两条独立通道，鉴权相同（Bearer，无需签名）。
 //
-// 一个必须记住的差异：**媒体接口永远返回 HTTP 200**，业务错误放在 body 的
-// code 字段里。所以调用方不能只看状态码，必须解析 code：
+// 一个必须记住的差异：**业务错误放在 body 的 code 字段里，HTTP 状态不可靠**。
+// 同一批工具并不统一：image_synthesize / remove_image_background 缺必填字段回 400，
+// upload_to_cdn 回 200 + code=400（2026-11-17 空载荷实测）。所以调用方不能只看
+// 状态码，必须解析 code：
 //
 //	0    成功
 //	400  参数问题（换号也一样失败，直接透出）
@@ -29,15 +31,31 @@ import (
 
 // 工具名（对应上游 /mavis/api/v1/mcp/<tool>）。
 const (
-	ToolImageSynthesize  = "image_synthesize"
-	ToolVideoSubmit      = "submit_video_generation"
-	ToolVideoQuery       = "query_video_generation"
-	ToolSpeech           = "synthesize_speech"
-	ToolTranscribe       = "listen_audio"
-	ToolVoiceList        = "get_voice_list"
-	ToolMusic            = "batch_text_to_music"
-	ToolTextToAudio      = "batch_text_to_audio"
-	ToolImagesUnderstand = "images_understand"
+	ToolImageSynthesize = "image_synthesize"
+	ToolVideoSubmit     = "submit_video_generation"
+	ToolVideoQuery      = "query_video_generation"
+	ToolSpeech          = "synthesize_speech"
+	ToolTranscribe      = "listen_audio"
+	ToolVoiceList       = "get_voice_list"
+	ToolMusic           = "batch_text_to_music"
+	// batch_text_to_audio 与 images_understand 以前只声明没路由，现在分别由
+	// ToolTextToAudio（批量 TTS，尚未对外）与 ToolDescribeImages 使用。
+	ToolTextToAudio = "batch_text_to_audio"
+
+	// 以下常量值是**HTTP 路径用的短名**，不是 /mcp/tools 目录里带 matrix_ 前缀的名字
+	// —— 实测（2026-11-17，{} 空载荷探活）：`/mcp/matrix_*` 一律 404，短名才受理。
+	// 而且有两个不是简单去前缀，照目录名拼会直接 404：
+	//   matrix_describe_images      → images_understand
+	//   matrix_reverse_image_search → image_reverse_search
+	// 换工具名前请先空载荷探一次，别硬拼。
+	ToolGenVideos          = "gen_videos" // 同步出片：自带轮询，直回 output_url
+	ToolRemoveBackground   = "remove_image_background"
+	ToolEnhanceImage       = "enhance_image" // 2× 超分
+	ToolReverseImageSearch = "image_reverse_search"
+	ToolDescribeImages     = "images_understand"
+	ToolVideosUnderstand   = "videos_understand"
+	ToolAudiosUnderstand   = "audios_understand"
+	ToolUploadToCDN        = "upload_to_cdn"
 )
 
 // maxBody 限制单次响应体大小。媒体接口只回 URL 与元数据，8MB 足够宽裕；

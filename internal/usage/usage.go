@@ -31,6 +31,14 @@ type Day struct {
 	Total   Bucket            `json:"total"`
 	Models  map[string]Bucket `json:"models"`
 	Account map[string]Bucket `json:"account,omitempty"`
+
+	// Media / MediaTotal 是媒体类调用（图片、视频、音频）的**次数**桶。
+	//
+	// 单列而不是并进 Total：媒体调用没有 token（上游不返回），混进 token 桶会让
+	// 「平均 token/请求」被图片请求拉低，看起来像模型变便宜了。
+	// 图片按张计费（实测 115 units/张，1K/2K/4K 同价），所以这里只统计次数与耗时。
+	Media      map[string]Bucket `json:"media,omitempty"`
+	MediaTotal Bucket            `json:"media_total,omitempty"`
 }
 
 type fileShape struct {
@@ -109,11 +117,43 @@ func (t *Tracker) Record(model, account string, prompt, output, cached int, late
 	t.mu.Unlock()
 }
 
+// RecordMedia 记录一次媒体调用（图片 / 视频 / 音频）。
+//
+// 与 Record 分开是因为媒体没有 token 概念：只有次数、耗时、成败。
+func (t *Tracker) RecordMedia(model string, latency time.Duration, isErr bool) {
+	date := time.Now().Format("2006-01-02")
+	t.mu.Lock()
+	d, ok := t.days[date]
+	if !ok {
+		d = &Day{Date: date, Models: map[string]Bucket{}, Account: map[string]Bucket{}}
+		t.days[date] = d
+	}
+	if d.Media == nil {
+		d.Media = map[string]Bucket{}
+	}
+	apply := func(b *Bucket) {
+		b.Requests++
+		if isErr {
+			b.Errors++
+		}
+		b.LatencyMs += latency.Milliseconds()
+	}
+	apply(&d.MediaTotal)
+	if model != "" {
+		b := d.Media[model]
+		apply(&b)
+		d.Media[model] = b
+	}
+	t.mu.Unlock()
+}
+
 // DayView 面板展示用。
 type DayView struct {
-	Date   string   `json:"date"`
-	Total  Bucket   `json:"total"`
-	Models []Series `json:"models"`
+	Date       string   `json:"date"`
+	Total      Bucket   `json:"total"`
+	Models     []Series `json:"models"`
+	Media      []Series `json:"media"`
+	MediaTotal Bucket   `json:"media_total"`
 }
 
 type Series struct {
@@ -135,6 +175,11 @@ func (t *Tracker) Series(n int) []DayView {
 				v.Models = append(v.Models, Series{Name: name, Bucket: b})
 			}
 			sort.Slice(v.Models, func(a, b int) bool { return v.Models[a].Bucket.Requests > v.Models[b].Bucket.Requests })
+			v.MediaTotal = d.MediaTotal
+			for name, b := range d.Media {
+				v.Media = append(v.Media, Series{Name: name, Bucket: b})
+			}
+			sort.Slice(v.Media, func(a, b int) bool { return v.Media[a].Bucket.Requests > v.Media[b].Bucket.Requests })
 		}
 		out = append(out, v)
 	}
@@ -149,6 +194,29 @@ func (t *Tracker) Today() Bucket {
 		return d.Total
 	}
 	return Bucket{}
+}
+
+// TodayMedia 今日媒体调用汇总。
+func (t *Tracker) TodayMedia() Bucket {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if d, ok := t.days[time.Now().Format("2006-01-02")]; ok {
+		return d.MediaTotal
+	}
+	return Bucket{}
+}
+
+// AllTimeMedia 历史媒体调用汇总。
+func (t *Tracker) AllTimeMedia() Bucket {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var sum Bucket
+	for _, d := range t.days {
+		sum.Requests += d.MediaTotal.Requests
+		sum.Errors += d.MediaTotal.Errors
+		sum.LatencyMs += d.MediaTotal.LatencyMs
+	}
+	return sum
 }
 
 // AllTime 历史总计。

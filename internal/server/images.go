@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/imageproto"
 	"github.com/linguo2625469/minimaxcode2api/internal/media"
 	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
+	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 )
 
 // 图片接口按 OpenAI 图像协议的 canonical 契约实现：
@@ -70,10 +73,17 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 参考图归一：上游 image_synthesize 的 input_urls 只认 cdn_url 或内联
+	// base64，任意公网 URL 会被上游拒掉（HTTP 200 + generation_failed，
+	// 原文见 fetchmedia.go）。这里代劳下载 → data URI，与图像工具同一套 SSRF 防护。
+	if perr == nil {
+		req.Image, perr = s.inlineImageRefs(r.Context(), req.Image)
+	}
 	if perr == nil {
 		var payload map[string]any
 		var warnings []string
-		payload, warnings, perr = req.Build()
+		// 默认档位来自配置：客户端没指定 size/quality/resolution 时用它。
+		payload, warnings, perr = req.Build(s.Cfg.Load().Defaults.ImageResolution)
 		if perr == nil {
 			s.runImageGeneration(w, r, req, payload, warnings, start)
 			return
@@ -81,6 +91,47 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logMedia(r, "", perr.Status, start, errors.New(perr.Message))
 	writeImageError(w, perr)
+}
+
+// maxImageRefRaw 是参考图内联的上限（原始字节）。
+//
+// 上游对 input_urls 里 base64 的硬上限没有文档；实测 1.05MB base64 可过。
+// 取 8MiB 原图（≈10.7MB base64）而不是 maxInlineFetch 的 20MiB：参考图通常远小于此，
+// 超过就明确报错，不去赌一个必然很慢的大请求。
+const maxImageRefRaw = 8 << 20
+
+// inlineImageRefs 把 image 字段的引用归一成上游能吃的形式。
+//
+//   - cdn.hailuoai.com 的地址 → 原样（上游自己的 CDN，省一次往返）
+//   - 其它 http(s) → 下载（SSRF 防护）→ data URI
+//   - data URI / 裸 base64 → 原样
+//
+// 这是「客户端只给 URL 也能用」的关键：以前这里直接透传，公网 URL 一律 502。
+func (s *Server) inlineImageRefs(ctx context.Context, refs []string) ([]string, *imageproto.ProtocolError) {
+	if len(refs) == 0 {
+		return refs, nil
+	}
+	out := make([]string, 0, len(refs))
+	for i, ref := range refs {
+		src := strings.TrimSpace(ref)
+		switch {
+		case isUpstreamCDN(src):
+			out = append(out, src)
+		case strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://"):
+			body, mime, err := s.fetchExternal(ctx, src, maxImageRefRaw)
+			if err != nil {
+				return nil, &imageproto.ProtocolError{
+					Status: http.StatusBadRequest, Type: "invalid_request_error",
+					Param: fmt.Sprintf("image[%d]", i), Code: "fetch_failed",
+					Message: fmt.Sprintf("第 %d 张参考图下载失败: %v", i+1, err),
+				}
+			}
+			out = append(out, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(body))
+		default:
+			out = append(out, src)
+		}
+	}
+	return out, nil
 }
 
 // runImageGeneration 是两条前门共用的执行体。
@@ -160,6 +211,12 @@ func (s *Server) runImageGeneration(
 
 	s.logMedia(r, req.Model, http.StatusOK, start, nil)
 	out := map[string]any{"created": time.Now().Unix(), "data": data}
+	// 方舟协议的 usage 是**张数**口径（generated_images / input_images）。
+	// output_tokens 不编造：上游响应里没有尺寸信息，算面积需要额外下载图片。
+	out["usage"] = map[string]any{
+		"generated_images": len(data),
+		"input_images":     len(req.Image),
+	}
 	// warnings 是附加字段（协议允许透传附加键），只在非空时出现。
 	if len(warnings) > 0 {
 		out["warnings"] = warnings
@@ -186,6 +243,19 @@ func writeImageError(w http.ResponseWriter, perr *imageproto.ProtocolError) {
 // 402 是配额/限额触顶 → 402 + insufficient_quota，让运维一眼区分
 // 「限额了」与「请求写错了」。限额通常会重置，客户端应稍后重试。
 func imageErrorFromMedia(err error) *imageproto.ProtocolError {
+	// 池的两种容量错误先认：它们不是"上游错误"，报 502 会让运维去查上游。
+	if errors.Is(err, pool.ErrNoAccount) {
+		return &imageproto.ProtocolError{
+			Status: http.StatusServiceUnavailable, Type: "api_error",
+			Code: "no_account", Message: err.Error(),
+		}
+	}
+	if errors.Is(err, pool.ErrAllBusy) {
+		return &imageproto.ProtocolError{
+			Status: http.StatusTooManyRequests, Type: "api_error",
+			Code: "all_accounts_busy", Message: err.Error(),
+		}
+	}
 	var me *media.Error
 	if !errors.As(err, &me) {
 		return &imageproto.ProtocolError{

@@ -37,7 +37,7 @@ go build -o minimaxcode2api ./cmd/server
 ./minimaxcode2api -config ./config.json
 ```
 
-首次启动会自动生成 `config.json`（含随机 `api_key`，形如 `sk-mmx-…`）并打印：
+首次启动会自动生成 `config.json`（含随机 `api_key`）并打印：
 
 ```
 minimaxcode2api 0.1.0 启动中
@@ -63,6 +63,17 @@ docker compose up -d --build
 ```
 
 数据全部落在 `./data`（`config.json` / `accounts.json` / `usage.json`），备份这个目录就够了。
+
+## 发版
+
+两条路，产物一致：
+
+- **CI（默认）**：push 到 `main` 即 patch 自增发版；要 major/minor 就人工 `git tag -a vX.Y.Z && git push origin vX.Y.Z`；给已有 tag 补发用 `gh workflow run release.yml -f tag=vX.Y.Z`。
+- **本地（Actions 不可用时）**：`./scripts/release.sh`，`-t vX.Y.Z` 指定版本，`--no-push` 只构建 + 冒烟。
+
+产物是 `linux/amd64` 二进制（tar.gz + sha256）与 `ghcr.io/yuanjie-ai/minimaxcode2api` 的三个 tag（`<version>` / `latest` / `sha-<7位>`），外加一个 GitHub Release。纯文档提交在 commit message 里带 `[skip release]` 可跳过发版。
+
+版本号由构建期 `-ldflags -X .../internal/server.Version` 注入，所以 `internal/server/server.go` 里的 `Version` 必须是 `var`；源码里的字面量只是本地 `go build` 的兜底值。
 
 ## 账号怎么来（重要）
 
@@ -93,7 +104,7 @@ docker compose up -d --build
 | `GET /healthz` | 健康检查（免鉴权） |
 | `GET /status` | 运行状态（鉴权） |
 | `POST /signin` | 账号池全员每日签到（鉴权），见《[每日签到](#每日签到)》 |
-| `GET /panel/` | Web 管理台 |
+| `GET /panel/` | Web 管理台（账号、用量、日志、配置热改；文本与媒体调用分列统计） |
 
 鉴权：`Authorization: Bearer <api_key>` 或 `x-api-key: <api_key>`。
 
@@ -113,7 +124,7 @@ curl http://127.0.0.1:7864/v1/messages \
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:7864
-export ANTHROPIC_AUTH_TOKEN=sk-mmx-…
+export ANTHROPIC_AUTH_TOKEN=sk-minimaxcode
 export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 ```
 
@@ -128,7 +139,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `MiniMax-M3.1-Flash` | `chat` | `POST /v1/chat/completions`、`POST /v1/messages` | `M3.1-Flash` `m3.1-flash` `MiniMax-M3.1` |
 | `MiniMax-M3` | `chat` | 同上 | `M3` `minimax-m3` |
 | `MiniMax-Image` | `image` | `POST /v1/images/generations` | `image` `h3-image` `image-01` |
-| `MiniMax-H3` | `video` | `POST /v1/contents/generations/tasks` | `h3` `h3-max` `minimax-h3-max` |
+| `MiniMax-H3` | `video` | `POST /v1/contents/generations/tasks` | `h3` `minimax-h3` |
+| `MiniMax-H3-Max` | `video` | 同上 | `h3-max` `minimax-h3-max-fast` |
 | `MiniMax-Hailuo-2.3` | `video` | 同上 | `h2.3` `hailuo` `hailuo-2.3` `minimax-hailuo-23` |
 
 对话模型额外带 `context_window` / `max_output` / `reasoning`；媒体模型不带这些字段
@@ -138,8 +150,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 > `MiniMax-Image` 是**能力标签**，不是上游型号：上游 `image_synthesize` 没有 `model`
 > 参数（见《[图片接口](#图片接口openai-图像协议)》）。列它只为让客户端能把「图片」
 > 配成一个可选的 model id。图片请求里写别的未知 model 也照常放行 —— 那个字段不生效，
-> 不值得为它拒绝请求。视频不同：`model` 决定计费与能力（H3 才有全模态参考），
-> 所以只认上面两个。
+> 不值得为它拒绝请求。视频不同：`model` 决定计费与能力（全模态参考只有 H3 有），
+> 所以只认上面三个，错值直接 400。
 
 模型发错端点会直接 `400` 指路，而不是透传给上游换来一句参数错误：
 
@@ -183,6 +195,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `pool.breaker_failures` / `breaker_cooldown` | 连续失败熔断 |
 | `pool.refresh_before` | 提前多久刷新 token（默认 10 分钟） |
 | `defaults.model` / `max_tokens` / `thinking_policy` | 未显式指定时的缺省值 |
+| `defaults.image_resolution` | 图片请求没写 `size`/`quality`/`resolution` 时的档位：`1K`（默认）/`2K`/`4K`/`auto` |
 | `models.expose` / `aliases` / `hidden` | 对外模型清单与别名 |
 
 环境变量（优先级高于文件，容器部署用）：
@@ -203,7 +216,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 - **429**：按指数退避冷却该账号后换号；
 - **5xx / 网络错误**：短冷却后换号；
 - **400/404/422**：请求本身有问题，换号也一样失败，**直接透出**上游状态与消息；
-- **全部账号都 401/403**：`502 upstream_auth` —— 下游的 `sk-mmx` 已经验过，失效的是
+- **全部账号都 401/403**：`502 upstream_auth` —— 下游 API Key 已经验过，失效的是
   网关自己的上游账号。这里**不能**回 401：客户端会以为自己 key 错了，重配换 key 都无救。
 
 错误对象统一是 OpenAI 的四键形状 `{message, type, param, code}`（`param` 拿不到字段名时
@@ -283,7 +296,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 `/matrix/api/v1/mcp/*` 重写成 `/mavis/api/v1/mcp/*` 再发。鉴权同样只要
 `Authorization: Bearer`，**不需要 `x-signature`**。
 
-已实现的路由（都真调过上游）：
+已实现的路由（✅ 真调过上游；🟡 只做到实现 + 单测，出参待首次真实调用确认）：
 
 | 路由 | 说明 | 状态 |
 |---|---|---|
@@ -293,11 +306,24 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
 | `POST /v1/audio/music` | 音乐生成，默认回字节，`response_format=url` 回链接 | ✅ 真调通过 |
 | `GET /v1/voices` | 音色列表（实测 327 个） | ✅ 真调通过 |
+| `POST /v1/images/remove-background` | 抠图 → 透明 PNG（回顶层 `output_url`） | ✅ 真调通过 |
+| `POST /v1/images/upscale` | 2× 超分（512→1024 实测） | ✅ 真调通过 |
+| `POST /v1/images/reverse-search` | 以图搜图（回 `data[]`） | ✅ 真调通过 |
+| `POST /v1/images/describe` | 图片问答（回 `results[].description`） | ✅ 真调通过 |
+| `POST /v1/audio/understand` | 音频问答（≤10 条） | 🟡 错误路径已验证，成功路径未跑 |
+| `POST /v1/videos/understand` | 视频问答（≤10 条） | 🟡 未真调（出参与图片同族） |
+| `POST /v1/contents/generations` | 同步出片，**仅 Hailuo-2.3** | 🟡 请求路径已验证，成功出参未跑 |
+
+✅ 的几条已用真实调用验过出参（2026-11-17，合计约 1.1k units）；🟡 的按同族推断，
+认不出来时显式 502，不返回空对象。
 
 ### 上游的五个坑（都是实测踩出来的）
 
-1. **业务错误永远 HTTP 200**，真正的码在 body 的 `code` 里：`0` 成功、`400` 参数、
-   `402` 计费、`401` 凭据。只看状态码会把"限额触顶"当成成功。
+1. **业务码在 body 的 `code` 里，HTTP 状态不可靠**：`0` 成功、`400` 参数、`402` 计费、
+   `401` 凭据。同一批工具的 HTTP 层并不统一 —— 实测 `image_synthesize`、
+   `remove_image_background` 缺必填字段回 **HTTP 400**，而 `upload_to_cdn` 回
+   **HTTP 200 + `code=400`**。只看状态码会把"限额触顶"当成成功，只看 body 又会漏掉
+   传输层失败，两者都得判。
 2. **`code=503` 不是失败，是"稍后再查"**。视频会返回
    `status=succeeded` + `code=503` + "已就绪但还没准备好下发，查同一个 task_id，
    别重新提交"。网关此时对外报 `status=running` 并带上 `upstream_status`，
@@ -319,6 +345,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | 图片生成 / TTS / ASR / 音乐 | 正常出结果（成本低，走各自的额度池） |
 | `MiniMax-Hailuo-2.3` 视频 | 提交需 **280 credits**，额度不足时 `402` |
 | `MiniMax-H3` 视频 | 提交需 **416 credits**，且只走 M Plan 周额度 |
+| `MiniMax-H3-Max` 视频 | 5s/480P 实测报价 **229 credits**，与 H3 同属"需套餐档覆盖或账户积分" |
 
 **402 是限额触顶，不是余额不足。** 上游原文写的是 "plan balance has run out …
 need to top up"，但控制台实际显示的是：
@@ -379,6 +406,12 @@ need to top up"，但控制台实际显示的是：
 |---|---|---|
 | `aspect_ratio` | `auto` + 十种比例 | 直接写进上游槽位；`auto` = **不写这个键**，交上游按 prompt 决定 |
 | `resolution` | `auto` + `1K` `2K` `4K` | 同上。`auto` 是客户端 UI 的默认档位（截图里的「比例 Auto」） |
+
+**方舟协议的渠道字段**（`watermark` / `stream` / `sequential_image_generation*`）会被
+吞掉并回一条 `warnings`：MiniMax 上游没有这些能力，透传有被当未知参数拒绝的风险。
+`watermark` 尤其常见 —— 方舟默认 `true`（不传就打水印），客户端一般显式传 `false`；
+本渠道不加水印，忽略即可。响应的 `usage` 用方舟的**张数**口径
+（`generated_images` / `input_images`），不编造 `output_tokens`（上游不返回尺寸）。
 
 > `aspect_ratio` 的合法值（2026-11-12 直连上游逐个复测）：`21:9` `16:9` `3:2` `4:3`
 > `5:4` `1:1` `4:5` `3:4` `2:3` `9:16`。客户端 UI 里还有 `3:1` / `1:3`，但**上游
@@ -449,6 +482,24 @@ need to top up"，但控制台实际显示的是：
 `1280x720→1K/16:9`、`1536x1024→2K/3:2`、`4096x4096→4K/1:1`；`quality=hd` 显式优先。
 批量 `n=3` 实测三张各不相同且槽位对应正确。
 
+`size` 是**双模**语义（与方舟协议一致），两种形态都认：
+
+| 写法 | 含义 | 行为 |
+|---|---|---|
+| `4096x4096` / `4096X4096` / `4096×4096` / `1024*1024` / `1024 X 1024` | 像素 | 吸附成「比例 + 档位」，如 `4096×4096 → 4K/1:1` |
+| `1K` / `1.5K` / `2K` / `3K` / `4K` | 方舟档位 | 只定档位（`1.5K→2K`、`3K→4K`），**比例不指定**，由模型按 prompt 判断 |
+| `auto` | 自动 | 比例与档位都不指定，档位回落 `defaults.image_resolution` |
+
+档位模式下不下发 `aspect_ratio` 是刻意的：方舟的档位语义是「像素与比例都交模型」，
+硬写 1:1 会让所有用 `size:"2K"` 的客户端都拿到方图。**解析不了的 `size` 返回 400**，
+不再静默回落 1K —— 静默改档位等于静默改账单。
+
+**计费口径（2026-11-18 实测，`tp_remains` 前后差标定）**：图片按**张**计价，
+`1K` / `2K` / `4K` 都是 **115 units/张**，比例与档位都不影响；同一请求 `n=2` 就是两张。
+所以想要分辨率就把 `resolution` 写到 `4K`，不加价，只加时间：
+1K≈14s、2K≈29s、4K≈57s。`defaults.image_resolution` 默认仍是 `1K`，因为默认值要服务
+通用交互场景；愿意用时间换分辨率的客户端显式写 `4K`。
+
 ### 三处登记偏差（渠道限制，不是实现偷懒）
 
 | 偏差 | 原因 | 表现 |
@@ -497,8 +548,16 @@ need to top up"，但控制台实际显示的是：
 }
 ```
 
-`model` 支持 `MiniMax-H3`（原生音频 + 多模态参考，需 416 credits）与
-`MiniMax-Hailuo-2.3`（需 280 credits），别名 `h3` / `h2.3`。
+`model` 支持三个型号，别名 `h3` / `h3-max` / `h2.3`：
+
+| 型号 | 能力 | 约束 |
+|---|---|---|
+| `MiniMax-H3` | 文生 / 首尾帧 / 全模态参考，自带原生音轨，需 416 credits | 768P / 2K，4–15 秒，7 种比例 |
+| `MiniMax-H3-Max` | 快出片变体（约 20 秒完成），只能文生 + 首尾帧 | **480P / 768P**，**5–15 秒**，没有 2K |
+| `MiniMax-Hailuo-2.3` | 成本更低，需 280 credits | 6 或 10 秒；1080P 仅 6 秒 |
+
+> `h3-max` 以前被并进 `MiniMax-H3`，客户端要"快"实际拿到的是"慢而好"，属于静默改档；
+> 现在两者是独立条目，`/v1/models` 也分开列。
 
 ### 六态与三条硬规矩
 
@@ -577,6 +636,110 @@ token 用量，所以通常没有这一项，这是**已知缺口**而不是省�
 - 参考视频要额外给 `reference_video_duration_seconds`（上游拿它校验，网关无法可靠探测远程时长）；
 - 参考图 / 参考视频 / 参考音频只支持 `MiniMax-H3`。
 
+## 扩展能力（同步视频 / 图像工具 / 理解类）
+
+这一组路由对应上游 `GET /mavis/api/v1/mcp/tools` 里**本网关此前没有暴露**的工具。
+它们与图片/视频共用同一个媒体网关与鉴权，错误信封也是同一套四键
+（`message` / `type` / `param` / `code`）。
+
+### 媒体来源的硬约束（实测）
+
+上游这些工具**不吃任意公网 URL**，只认「本环境上传后的 `cdn_url`」或内联 base64：
+
+```
+image_info.url could not be used as a media source; download the resource in your local
+or sandbox workspace first, then call matrix_get_upload_url … / matrix_upload_to_cdn …
+```
+
+所以网关代劳，客户端仍然可以只给 URL：
+
+| 场景 | 网关行为 |
+|---|---|
+| 已是 `cdn.hailuoai.com` 的地址 | 原样下发（省一次往返） |
+| 其它 http(s)（图像工具） | 下载 → `upload_to_cdn` 换 cdn_url（**≤600KiB base64**，约 450KiB 原图） |
+| 其它 http(s)（理解类） | 下载 → 内联成 base64（**≤20MiB**，不经 CDN） |
+
+出站下载带 SSRF 防护：只允许 http/https，域名先解析检查，`Dialer.Control` 在实际拨号的
+IP 上再复核一次（防 DNS rebinding），重定向逐跳复核，限大小与超时。
+
+同一套归一化对 **`POST /v1/images/generations` 的 `image` 字段**同样生效：公网 URL 会被
+下载后内联成 `data:` URI（不经 CDN，省一次往返），单张上限 **8MiB**。0.5.1 及以前这里
+是原样透传，客户端给任意公网 URL 会拿到 502 `generation_failed`。
+超过 600KiB 的图走图像工具会直接 400 并说明上限 —— 不代发注定失败的请求。
+
+### 同步视频（仅 Hailuo-2.3）
+
+```bash
+curl $BASE/v1/contents/generations -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model": "MiniMax-Hailuo-2.3",
+    "content": [{"type": "text", "text": "海边灯塔，黄昏，慢推镜"}],
+    "duration": 6, "resolution": "720p"
+  }'
+```
+
+**只能用它跑 `MiniMax-Hailuo-2.3`。** 这是上游 400 原文实测的，不是设计选择：
+
+```
+requests[0].model legacy video tools support only `MiniMax-Hailuo-2.3`;
+use `matrix_submit_video_generation` followed by `matrix_query_video_generation` for `MiniMax-H3`
+```
+
+H3 / H3-Max 发给同步接口会被**本地 400** 拦下并指回 `/v1/contents/generations/tasks`，
+不消耗额度。参数面也比异步窄：
+
+| 项 | 同步接口 | 异步接口 |
+|---|---|---|
+| 模型 | 仅 `MiniMax-Hailuo-2.3` | H3 / H3-Max / Hailuo |
+| 时长 | 6 / 10 秒 | H3 4–15 秒、H3-Max 5–15 秒 |
+| 档位 | 768P / 1080P（1080P 仅 6 秒） | H3 768P/2K、H3-Max 480P/768P |
+| 图片 | 仅单张首帧 | 首尾帧 + 全模态参考（H3） |
+| 其他 | 无 ratio / watermark / seed（会给 warning） | 全量 |
+
+响应 `{"created","model","data":[{"url"}]}`，不带 `task_id` —— 它没有可轮询的任务，
+不伪装成任务对象。上游自带轮询（≤20min），适合 Dify / n8n 这类不写轮询的客户端。
+
+### 图像工具
+
+```bash
+curl $BASE/v1/images/remove-background -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"image":"https://…/photo.jpg"}'
+```
+
+`upscale`（固定 2×）、`reverse-search` 同构，都支持 `response_format=b64_json`。
+
+实测出参：
+
+| 工具 | 出参 |
+|---|---|
+| `remove-background` | `{"output_url","mime_type","width","height","size_bytes"}` |
+| `upscale` | 同上（512×512 → 1024×1024） |
+| `reverse-search` | `{"data":[{"index","title","link","source","image_url","snippet"}]}` |
+
+网关把前两个映射成 `{created,data:[{url}]}`（与 `/v1/images/generations` 一致），
+搜图把 `data[]` 原样放进 `results`。
+
+### 理解类
+
+```bash
+curl $BASE/v1/images/describe -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "items": [{"url":"https://…/a.png","prompt":"图里有几只猫？"}],
+    "prompt": "请描述这张图片的内容"
+  }'
+```
+
+三条路由同构（`/v1/images/describe`、`/v1/videos/understand`、`/v1/audio/understand`），
+`items` 1–10 项，每项 `url` 或 `data`，`prompt` 逐项覆盖顶层默认值；都不给时按模态兜底。
+
+上游出参是 `results[]`，每项 `{"success","description","error"}` —— **失败也是 HTTP 200**，
+错误在 `results[].error` 里。网关会把 `error` 顶成 502 的 message（否则客户端只会看到
+"没有文本结果"，排查方向全错）。条数与请求不一致时响应带 `warnings`。
+
+> 为什么不做成 `/v1/chat/completions` 的视频/音频输入：上游文本链路只有 `image_url`
+> 一种媒体块是实测通的，视频/音频块能否通过**未验证**。宁可给确定的路由，
+> 不赌 chat 端点认不认。
+
 ## 国内版 / 国际版
 
 客户端二进制里是**一套双区域映射**（`dist/main/config/constants.js`）：
@@ -597,9 +760,17 @@ token 用量，所以通常没有这一项，这是**已知缺口**而不是省�
 ## 边界（明确不做）
 
 - 不做 `/v1/responses`、embeddings、rerank；
-- 不做「视觉理解 / 联网搜索」的独立路由：视觉走 `/v1/chat/completions` 的图片输入即可
-  （上游 `images_understand`、`web_search` 这些工具能调通，但属于 agent 内部工具，没做成对外 API）；
+- 不做**联网搜索**的独立路由（上游 `web_search` 属 agent 内部工具）；
+  图片/视频/音频的**理解**已由 `/v1/images/describe`、`/v1/videos/understand`、
+  `/v1/audio/understand` 三条确定路由承担，不再走 chat 端点赌媒体块能不能过；
 - 视频不做回调、不做取消（上游两者都不支持，见上一节）；
+- 同步视频**不做批量**：上游 `success_items` 与请求之间没有可靠的索引对应，某条失败时
+  无法判定是哪一条 —— 把失败归错主比不做批量更糟；
+- 不做图片文字搜索（上游要求必传"相关性提示词 + task_name"，语义与普通搜索不同），
+  只做以图搜图；
+- 图像工具的单图上限 **600KiB base64（约 450KiB 原图）**（上游 `upload_to_cdn` 的硬限制）。
+  更大的图需要官方 OSS 签名直传（`matrix_get_upload_url` + PUT），网关暂不代持对象存储；
+  理解类不受此限（走内联 base64，上限 20MiB）；
 - 不做计费与配额，用量只统计不扣费；
 - 不做多用户/RBAC，面板是单人运维工具；
 - 请求日志只在内存环形缓冲里，重启即清空（长期审计请接外部日志）；
@@ -614,6 +785,7 @@ internal/store/      账号持久化（原子写，0600）
 internal/oauth/      设备授权（PKCE）、刷新、撤销
 internal/upstream/   上游客户端（Anthropic Messages）
 internal/media/      媒体网关客户端（/mavis/api/v1/mcp/*，业务码在 body 里）
+                     └ result.go：出参候选键提取（认不出就报错，不猜结构）
 internal/convert/    OpenAI ⇄ Anthropic 协议转换（请求/响应/流式）
 internal/imageproto/ OpenAI 图像协议：canonical 折叠 + 上游槽位映射（纯函数）
 internal/videoproto/ 异步视频协议：canonical 折叠 + 六态收敛（纯函数）
@@ -621,6 +793,8 @@ internal/videotask/  视频任务快照（落盘，重启可查）
 internal/pool/       账号池调度、冷却、熔断
 internal/server/     HTTP 路由、SSE、重试与换号
                      └ images.go / videos.go / audio.go：媒体路由与产物下载
+                        video_sync.go / image_tools.go / understand.go：同步出片、
+                        图像工具、理解类（v0.6.0 新增）
 internal/panel/      管理台 API + 内嵌 UI（go:embed）
 internal/usage/      按天/模型/账号用量聚合
 internal/reqlog/     请求日志环形缓冲

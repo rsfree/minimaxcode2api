@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/media"
+	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 	"github.com/linguo2625469/minimaxcode2api/internal/videoproto"
 	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
 )
@@ -472,6 +473,21 @@ func writeProtoError(w http.ResponseWriter, perr *videoproto.ProtocolError) {
 // 归因纪律：客户端参数错 → 400；渠道凭据 → 502；额度 → 402 且保留
 // insufficient_quota（运维要能一眼看出是余额而不是请求写错）。
 func protoFromMedia(err error) *videoproto.ProtocolError {
+	// 池容量错误先认：它们不是上游错误，报 502 会让运维去查上游。
+	// （同步视频与异步任务共用这一段，早先只有媒体错误映射，没号时会被报成
+	// "上游不可达"，方向完全是错的。）
+	if errors.Is(err, pool.ErrNoAccount) {
+		return &videoproto.ProtocolError{
+			Status: http.StatusServiceUnavailable, Type: "api_error",
+			Code: "no_account", Message: err.Error(),
+		}
+	}
+	if errors.Is(err, pool.ErrAllBusy) {
+		return &videoproto.ProtocolError{
+			Status: http.StatusTooManyRequests, Type: "api_error",
+			Code: "all_accounts_busy", Message: err.Error(),
+		}
+	}
 	var me *media.Error
 	if !errors.As(err, &me) {
 		return &videoproto.ProtocolError{

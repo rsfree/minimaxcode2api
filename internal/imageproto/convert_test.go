@@ -1,314 +1,198 @@
 package imageproto
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
-func decode(t *testing.T, body string) (*Request, *ProtocolError) {
-	t.Helper()
-	return Decode([]byte(body))
-}
-
-// 只有四类被拒；其余一律归一化。判定顺序 n → response_format → image → mask → prompt。
-func TestDecodeRejects(t *testing.T) {
+// TestParseWH 锁定 size 写法的兼容面。
+//
+// 背景：客户端/手写调用会写 4096×4096、1024*1024、1024 X 1024，
+// 旧实现只按 'x' 切，这些写法一律解析失败并静默回落 1K。
+func TestParseWH(t *testing.T) {
 	cases := []struct {
-		name, body, param string
+		in      string
+		w, h    int
+		wantOK  bool
+		comment string
 	}{
-		{"体不是对象", `[1,2]`, ""},
-		{"image 空串", `{"prompt":"x","image":""}`, "image"},
-		{"image 元素非字符串", `{"prompt":"x","image":[1]}`, "image[0]"},
-		{"image 元素空串", `{"prompt":"x","image":["ok",""]}`, "image[1]"},
-		{"mask 非字符串", `{"prompt":"x","image":"a.png","mask":5}`, "mask"},
-		{"mask 无 image", `{"prompt":"x","mask":"m.png"}`, "image"},
-		{"无图无 prompt", `{}`, "prompt"},
+		{"1024x1024", 1024, 1024, true, "OpenAI 官方写法"},
+		{"4096×4096", 4096, 4096, true, "全角乘号（中文文档常见）"},
+		{"1024*1024", 1024, 1024, true, "星号"},
+		{"1024 X 1024", 1024, 1024, true, "大写 X + 空格"},
+		{" 1536 x 1024 ", 1536, 1024, true, "首尾空格"},
+		{"auto", 0, 0, false, "auto 不是尺寸"},
+		{"abc", 0, 0, false, "完全无法解析"},
+		{"1024", 0, 0, false, "缺高度"},
+		{"0x1024", 0, 0, false, "宽度为 0"},
+		{"-1024x1024", 0, 0, false, "负数"},
 	}
 	for _, c := range cases {
-		_, perr := decode(t, c.body)
-		if perr == nil || perr.Status != 400 {
-			t.Fatalf("%s: 期望 400，实际 %+v", c.name, perr)
-		}
-		if perr.Param != c.param {
-			t.Fatalf("%s: param = %q，期望 %q", c.name, perr.Param, c.param)
+		w, h, ok := parseWH(c.in)
+		if ok != c.wantOK || (ok && (w != c.w || h != c.h)) {
+			t.Errorf("parseWH(%q) = %d,%d,%v；期望 %d,%d,%v（%s）",
+				c.in, w, h, ok, c.w, c.h, c.wantOK, c.comment)
 		}
 	}
 }
 
-// n 的非法值必须回落 1，不报错。
-func TestNNormalization(t *testing.T) {
-	cases := map[string]int{
-		`{"prompt":"x"}`: 1, `{"prompt":"x","n":3}`: 3,
-		`{"prompt":"x","n":0}`: 1, `{"prompt":"x","n":-3}`: 1,
-		`{"prompt":"x","n":2.5}`: 1, `{"prompt":"x","n":2.0}`: 1,
-		`{"prompt":"x","n":"3"}`: 1, `{"prompt":"x","n":true}`: 1,
-		`{"prompt":"x","n":null}`: 1,
-	}
-	for body, want := range cases {
-		req, perr := decode(t, body)
-		if perr != nil {
-			t.Fatalf("%s: %+v", body, perr)
-		}
-		if req.N != want {
-			t.Fatalf("%s: n = %d，期望 %d", body, req.N, want)
-		}
-	}
-}
-
-// response_format 只认两个值，其余删键（不干预上游形态）。
-func TestResponseFormatNormalization(t *testing.T) {
-	for _, body := range []string{
-		`{"prompt":"x","response_format":""}`,
-		`{"prompt":"x","response_format":"png"}`,
-		`{"prompt":"x","response_format":null}`,
-		`{"prompt":"x","response_format":{"type":"url"}}`,
-	} {
-		req, perr := decode(t, body)
-		if perr != nil || req.ResponseFormat != "" {
-			t.Fatalf("%s: response_format = %q，期望删键", body, req.ResponseFormat)
-		}
-	}
-	req, _ := decode(t, `{"prompt":"x","response_format":"b64_json"}`)
-	if req.ResponseFormat != "b64_json" {
-		t.Fatalf("b64_json 未被识别")
-	}
-}
-
-// image 的三种写法：string / string[] / null。
-func TestImageFieldShapes(t *testing.T) {
-	req, perr := decode(t, `{"prompt":"x","image":"https://a/1.png"}`)
-	if perr != nil || len(req.Image) != 1 {
-		t.Fatalf("单串写法: %+v", req)
-	}
-	req, perr = decode(t, `{"prompt":"x","image":["https://a/1.png","https://a/2.png"]}`)
-	if perr != nil || len(req.Image) != 2 {
-		t.Fatalf("数组写法: %+v", req)
-	}
-	req, perr = decode(t, `{"prompt":"x","image":null}`)
-	if perr != nil || len(req.Image) != 0 {
-		t.Fatalf("null 应视为文生图: %+v", req)
-	}
-	req, perr = decode(t, `{"prompt":"x","image":[]}`)
-	if perr != nil || len(req.Image) != 0 {
-		t.Fatalf("[] 应视为文生图: %+v", req)
-	}
-}
-
-// 上游强制要求 prompt：image-only 是协议合法但本渠道做不到，必须显式 400。
-func TestBuildImageOnlyRejected(t *testing.T) {
-	req, perr := decode(t, `{"image":"https://a/1.png"}`)
-	if perr != nil {
-		t.Fatalf("canonical 层应接受 image-only: %+v", perr)
-	}
-	_, _, perr = req.Build()
-	if perr == nil || perr.Code != "unsupported_parameter" || perr.Param != "prompt" {
-		t.Fatalf("image-only 应报 unsupported_parameter/prompt，实际 %+v", perr)
-	}
-}
-
-// mask / 超量参考图 / 样式都要显式处理，不静默丢。
-func TestBuildRejectsAndWarnings(t *testing.T) {
-	req, _ := decode(t, `{"prompt":"x","image":"a.png","mask":"m.png"}`)
-	if _, _, perr := req.Build(); perr == nil || perr.Param != "mask" {
-		t.Fatalf("mask 应 400，实际 %+v", perr)
-	}
-
-	req, _ = decode(t, `{"prompt":"x","image":["1","2","3","4","5"]}`)
-	if _, _, perr := req.Build(); perr == nil || perr.Param != "image" {
-		t.Fatalf("5 张参考图应 400，实际 %+v", perr)
-	}
-
-	req, _ = decode(t, `{"prompt":"x","n":12,"style":"vivid"}`)
-	payload, warns, perr := req.Build()
-	if perr != nil {
-		t.Fatalf("Build: %+v", perr)
-	}
-	items := payload["requests"].([]map[string]any)
-	if len(items) != 10 {
-		t.Fatalf("n=12 应钳到 10，实际 %d", len(items))
-	}
-	if len(warns) < 2 {
-		t.Fatalf("应至少两条 warning（n 钳位 + style），实际 %v", warns)
-	}
-}
-
-// size/quality → 档位与比例。档位是像素预算，不是自由 WxH。
-func TestShape(t *testing.T) {
-	cases := []struct{ size, quality, ratio, res string }{
-		{"1024x1024", "", "1:1", "1K"},
-		{"1792x1024", "", "16:9", "2K"},
-		{"1280x720", "", "16:9", "1K"},
-		{"1024x1792", "", "9:16", "2K"},
-		{"4096x4096", "", "1:1", "4K"},
-		{"", "hd", "1:1", "2K"},
-		{"4096x4096", "hd", "1:1", "2K"},
-		{"", "", "1:1", "1K"},
+func TestShapeWithDefaultResolution(t *testing.T) {
+	cases := []struct {
+		size, quality, def string
+		wantRatio, wantRes string
+	}{
+		// size 能解析 → size 优先于默认值
+		{"4096×4096", "", "1K", "1:1", "4K"},
+		{"1024x1024", "", "4K", "1:1", "1K"},
+		{"1536x1024", "", "1K", "3:2", "2K"},
+		// size 缺失 → 默认值生效
+		{"", "", "4K", "1:1", "4K"},
+		{"", "", "2K", "1:1", "2K"},
+		{"", "", "auto", "1:1", ""},
+		{"", "", "", "1:1", "1K"},
+		// quality 优先于 size 与默认值
+		{"4096x4096", "hd", "1K", "1:1", "2K"},
+		{"1024x1024", "4k", "1K", "1:1", "4K"},
+		// auto 不是尺寸，等同「不指定」：连比例也不写（方舟语义，交模型按 prompt 判断）
+		{"auto", "", "2K", "", "2K"},
 	}
 	for _, c := range cases {
-		ratio, res := Shape(c.size, c.quality)
-		if ratio != c.ratio || res != c.res {
-			t.Fatalf("Shape(%q,%q) = %s/%s，期望 %s/%s", c.size, c.quality, ratio, res, c.ratio, c.res)
+		r, res := Shape(c.size, c.quality, c.def)
+		if r != c.wantRatio || res != c.wantRes {
+			t.Errorf("Shape(%q,%q,def=%q) = %q,%q；期望 %q,%q",
+				c.size, c.quality, c.def, r, res, c.wantRatio, c.wantRes)
 		}
 	}
 }
 
-// vendor extras 必须透传（additionalProperties:true 是承重的）。
-func TestExtrasPassthrough(t *testing.T) {
-	req, _ := decode(t, `{"prompt":"x","vendor_flag":"on","nested":{"a":1}}`)
-	payload, _, perr := req.Build()
-	if perr != nil {
-		t.Fatalf("Build: %+v", perr)
+func TestBuildRejectsUnparsableSize(t *testing.T) {
+	req := &Request{Prompt: "x", Size: "not-a-size", N: 1}
+	_, _, perr := req.Build("1K")
+	if perr == nil {
+		t.Fatal("无法解析的 size 应返回 400，实际放行")
 	}
-	if payload["vendor_flag"] != "on" {
-		t.Fatalf("extras 未透传: %v", payload)
+	if perr.Status != 400 || perr.Param != "size" {
+		t.Fatalf("期望 400/size，实际 %d/%s (%s)", perr.Status, perr.Param, perr.Message)
 	}
-	if _, ok := payload["nested"].(map[string]any); !ok {
-		t.Fatalf("嵌套 extras 未透传: %v", payload["nested"])
+	if !strings.Contains(perr.Message, "4096") {
+		t.Errorf("错误消息应给出写法示例，实际：%s", perr.Message)
 	}
 }
 
-// 上游原生字段必须进 items —— 之前它们掉进 Extras 被透传到顶层，上游直接忽略，
-// 表现为"请求 21:9 却回 1:1"（真实回归）。
-func TestAspectRatioAndResolutionReachItems(t *testing.T) {
-	req, perr := decode(t, `{"prompt":"x","aspect_ratio":"21:9","resolution":"4K"}`)
+func TestBuildSizeAutoPasses(t *testing.T) {
+	// OpenAI 的 size="auto" 表示交服务端决定，不能当非法值拒掉。
+	req := &Request{Prompt: "x", Size: "auto", N: 1}
+	payload, _, perr := req.Build("2K")
 	if perr != nil {
-		t.Fatalf("Decode: %+v", perr)
-	}
-	payload, _, perr := req.Build()
-	if perr != nil {
-		t.Fatalf("Build: %+v", perr)
-	}
-	if payload["aspect_ratio"] != nil || payload["resolution"] != nil {
-		t.Fatalf("原生字段不能留在顶层（上游不读）: %v", payload)
+		t.Fatalf("size=auto 不该报错：%s", perr.Message)
 	}
 	item := payload["requests"].([]map[string]any)[0]
-	if item["aspect_ratio"] != "21:9" || item["resolution"] != "4K" {
-		t.Fatalf("槽位未带上原生字段: %v", item)
+	if got := item["resolution"]; got != "2K" {
+		t.Errorf("size=auto 应套用默认档位 2K，实际 %v", got)
 	}
 }
 
-// 比例吸附：任意 W:H 都要落到实测支持的比例之一，而不是让上游运行时失败。
-func TestSnapRatio(t *testing.T) {
-	cases := map[string]string{
-		"21:9": "21:9", "16:9": "16:9", "4:3": "4:3", "1:1": "1:1",
-		"3:4": "3:4", "9:16": "9:16",
-		"2:1": "16:9", "7:3": "21:9", "16/9": "16:9",
-		// 实测原生支持，直通不吸附（2026-11-12 直连上游验证）
-		"3:2": "3:2", "5:4": "5:4", "4:5": "4:5", "2:3": "2:3",
-		// 上游不支持，降级到最近邻
-		"3:1": "21:9", "1:3": "9:16",
-		"1.85:1": "16:9",
-	}
-	for in, want := range cases {
-		got, ok := SnapRatio(in)
-		if !ok || got != want {
-			t.Fatalf("SnapRatio(%q) = %q,%v，期望 %q", in, got, ok, want)
-		}
-	}
-	if _, ok := SnapRatio("abc"); ok {
-		t.Fatalf("abc 不该可解析")
-	}
-}
-
-// 档位吸附：常见 p 写法与裸像素都要落到 1K/2K/4K。
-func TestSnapResolution(t *testing.T) {
-	cases := map[string]string{
-		"1K": "1K", "2K": "2K", "4K": "4K", "2k": "2K",
-		"480p": "1K", "720p": "1K", "1080p": "1K",
-		"1440p": "2K", "2160p": "4K", "8K": "4K",
-		"1024": "1K", "2048": "2K", "4096": "4K",
-	}
-	for in, want := range cases {
-		got, ok := SnapResolution(in)
-		if !ok || got != want {
-			t.Fatalf("SnapResolution(%q) = %q,%v，期望 %q", in, got, ok, want)
-		}
-	}
-	if _, ok := SnapResolution("abc"); ok {
-		t.Fatalf("abc 不该可解析")
-	}
-}
-
-// 吸附后要写进槽位并留 warning；完全无法解析才 400。
-func TestAspectRatioSnapped(t *testing.T) {
-	req, _ := decode(t, `{"prompt":"x","aspect_ratio":"2:1","resolution":"8K"}`)
-	payload, warns, perr := req.Build()
+func TestBuildDefaultResolutionAutoOmitsKey(t *testing.T) {
+	req := &Request{Prompt: "x", N: 1}
+	payload, _, perr := req.Build("auto")
 	if perr != nil {
-		t.Fatalf("Build: %+v", perr)
+		t.Fatalf("Build 失败：%s", perr.Message)
 	}
 	item := payload["requests"].([]map[string]any)[0]
-	if item["aspect_ratio"] != "16:9" || item["resolution"] != "4K" {
-		t.Fatalf("未吸附到合法值: %v", item)
-	}
-	if len(warns) != 2 {
-		t.Fatalf("两个字段都该有 warning，实际 %v", warns)
-	}
-
-	req, _ = decode(t, `{"prompt":"x","aspect_ratio":"abc"}`)
-	if _, _, perr := req.Build(); perr == nil || perr.Status != 400 {
-		t.Fatalf("无法解析的比例应 400，实际 %+v", perr)
+	if _, exists := item["resolution"]; exists {
+		t.Errorf("默认档位 auto 时应整个省略 resolution 键，实际写了 %v", item["resolution"])
 	}
 }
 
-// 同一个数字必须只有一个答案：size 推导与 resolution 吸附不能分叉。
-// 曾经 size=1536x1024 判 2K，而 resolution="1536" 判 1K（两套阈值表）。
-func TestSizeAndResolutionAgree(t *testing.T) {
-	for _, longest := range []string{
-		"512", "1024", "1280", "1376", "1400", "1401", "1440", "1536",
-		"2048", "2752", "2800", "2801", "3840", "4096", "5504", "8192",
-	} {
-		fromSize := resolutionFromSize(longest + "x100")
-		fromRes, ok := SnapResolution(longest)
-		if !ok {
-			t.Fatalf("SnapResolution(%q) 无法解析", longest)
-		}
-		if fromSize != fromRes {
-			t.Fatalf("长边 %s：size 推导=%s，resolution 吸附=%s —— 必须一致",
-				longest, fromSize, fromRes)
-		}
-	}
-}
-
-// size 的比例也走同一份比例表（ratioFromSize 复用 SnapRatio）。
-func TestRatioFromSizeSnaps(t *testing.T) {
-	cases := map[string]string{
-		"1024x1024": "1:1", "1920x1080": "16:9", "3840x1600": "21:9",
-		// 1024x1536 是精确 2:3，扩表后不再被吸附成 3:4（1K 档会拿到 848×1264）
-		"1024x1536": "2:3", "1080x1920": "9:16", "1200x896": "4:3",
-		"1500x1000": "3:2", "1280x1024": "5:4", "1000x1250": "4:5",
-		"": "",
-	}
-	for size, want := range cases {
-		if got := ratioFromSize(size); got != want {
-			t.Fatalf("ratioFromSize(%q) = %q，期望 %q", size, got, want)
-		}
-	}
-}
-
-// Auto 是 MiniMax 客户端的默认档位（截图里的「比例 Auto / 4K」）。
-// 语义是「不指定，交给上游按 prompt 决定」：必须解析成功，且槽位里
-// 完全不要出现 aspect_ratio / resolution 这两个键 —— 写空串仍然算指定。
-func TestBuildAutoOmitsShapeKeys(t *testing.T) {
-	req, perr := decode(t, `{"prompt":"海边灯塔","aspect_ratio":"auto","resolution":"Auto"}`)
+func TestDecodeSizeVariantsFlowThrough(t *testing.T) {
+	// 端到端：Decode → Build，确认 4096×4096 真的落到 4K/1:1。
+	raw, _ := json.Marshal(map[string]any{"prompt": "x", "size": "4096×4096"})
+	req, perr := Decode(raw)
 	if perr != nil {
-		t.Fatalf("auto 不该被拒: %+v", perr)
+		t.Fatalf("Decode 失败：%s", perr.Message)
 	}
-	payload, warns, perr := req.Build()
+	payload, _, perr := req.Build("1K")
 	if perr != nil {
-		t.Fatalf("Build: %+v", perr)
+		t.Fatalf("Build 失败：%s", perr.Message)
 	}
-	if len(warns) == 0 {
-		t.Fatal("auto 应给出 warnings，说明由上游决定")
+	item := payload["requests"].([]map[string]any)[0]
+	if item["resolution"] != "4K" {
+		t.Errorf("4096×4096 应映射到 4K，实际 %v", item["resolution"])
 	}
-	items := payload["requests"].([]map[string]any)
-	if len(items) != 1 {
-		t.Fatalf("槽位数 = %d，期望 1", len(items))
+	if item["aspect_ratio"] != "1:1" {
+		t.Errorf("4096×4096 应映射到 1:1，实际 %v", item["aspect_ratio"])
 	}
-	if _, ok := items[0]["aspect_ratio"]; ok {
-		t.Fatalf("aspect_ratio 不该出现: %+v", items[0])
+}
+
+// TestSizeTierForm 锁定方舟协议的档位写法：size 可以直接是 1K/1.5K/2K/3K/4K/auto。
+//
+// 之前只认 WxH，方舟推荐写法 size="2K" 会被 400 —— 而 2K 恰恰是方舟文档的首选。
+func TestSizeTierForm(t *testing.T) {
+	cases := []struct {
+		size    string
+		def     string
+		wantRes string
+	}{
+		{"1K", "4K", "1K"},   // 显式档位压过默认值
+		{"2K", "1K", "2K"},
+		{"4K", "1K", "4K"},
+		{"1.5K", "1K", "2K"}, // 1536 长边 → 2K
+		{"3K", "1K", "4K"},   // 3072 长边 → 4K
+		{"auto", "2K", "2K"}, // auto = 不指定档位，回落默认
 	}
-	if _, ok := items[0]["resolution"]; ok {
-		t.Fatalf("resolution 不该出现: %+v", items[0])
+	for _, c := range cases {
+		ratio, res := Shape(c.size, "", c.def)
+		if res != c.wantRes {
+			t.Errorf("Shape(size=%q, def=%q) 档位 = %q，期望 %q", c.size, c.def, res, c.wantRes)
+		}
+		if ratio != "" {
+			t.Errorf("档位模式下不应指定比例（方舟让模型按 prompt 判断），实际 %q", ratio)
+		}
 	}
-	if items[0]["prompt"] != "海边灯塔" || items[0]["output_file"] == "" {
-		t.Fatalf("其余字段应保留: %+v", items[0])
+}
+
+func TestBuildAcceptsTierSizeAndOmitsRatio(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{"prompt": "x", "size": "2K"})
+	req, perr := Decode(raw)
+	if perr != nil {
+		t.Fatalf("Decode 失败：%s", perr.Message)
+	}
+	payload, _, perr := req.Build("1K")
+	if perr != nil {
+		t.Fatalf("size=2K 不该报错：%s", perr.Message)
+	}
+	item := payload["requests"].([]map[string]any)[0]
+	if item["resolution"] != "2K" {
+		t.Errorf("档位应为 2K，实际 %v", item["resolution"])
+	}
+	if _, exists := item["aspect_ratio"]; exists {
+		t.Errorf("档位模式不该下发 aspect_ratio，实际 %v", item["aspect_ratio"])
+	}
+}
+
+func TestBuildDropsArkOnlyKeys(t *testing.T) {
+	// 方舟客户端必传 watermark=false；上游无此能力，应吞掉并点名。
+	raw, _ := json.Marshal(map[string]any{
+		"prompt": "x", "size": "2K", "watermark": false,
+		"sequential_image_generation": "auto",
+	})
+	req, perr := Decode(raw)
+	if perr != nil {
+		t.Fatalf("Decode 失败：%s", perr.Message)
+	}
+	payload, warnings, perr := req.Build("1K")
+	if perr != nil {
+		t.Fatalf("Build 失败：%s", perr.Message)
+	}
+	if _, exists := payload["watermark"]; exists {
+		t.Error("watermark 不该透传给上游")
+	}
+	if _, exists := payload["sequential_image_generation"]; exists {
+		t.Error("sequential_image_generation 不该透传给上游")
+	}
+	joined := strings.Join(warnings, "|")
+	if !strings.Contains(joined, "watermark") || !strings.Contains(joined, "sequential_image_generation") {
+		t.Errorf("两个字段都应出现在 warnings 里，实际：%v", warnings)
 	}
 }

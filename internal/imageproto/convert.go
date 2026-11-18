@@ -224,16 +224,39 @@ func normalizeN(v any) int {
 // 上游单次最多 10 个槽位。
 const maxSlots = 10
 
+// arkOnlyKeys 是方舟协议里「客户端常带、但本渠道无能力」的字段。
+//
+// watermark 尤其重要：方舟默认 true（不传就打水印），客户端一般会显式传 false。
+// MiniMax 上游没有水印开关，静默透传可能被当未知参数，所以吞掉并回一条 warning。
+var arkOnlyKeys = []string{
+	"watermark",
+	"stream",
+	"sequential_image_generation",
+	"sequential_image_generation_options",
+}
+
 // Build 把 canonical 折成上游 image_synthesize 的请求体。
 //
 // 返回 warnings：被显式忽略的能力（mask、style 等）。静默丢弃是最坏处置，
 // 要么 400，要么点名 —— 这里选择点名，因为 style 属于"可降级"的输出开关。
-func (r *Request) Build() (payload map[string]any, warnings []string, perr *ProtocolError) {
+func (r *Request) Build(defaultResolution string) (payload map[string]any, warnings []string, perr *ProtocolError) {
 	// 上游（MiniMax image_synthesize）强制要求非空 prompt，即使带参考图。
 	// 协议允许 image-only，但本渠道做不到 —— 显式 400，而不是偷偷编一个 prompt。
 	if r.Prompt == "" && len(r.Image) > 0 {
 		return nil, nil, badRequest("prompt", "unsupported_parameter",
 			"本渠道的图生图也要求 prompt（上游强制非空），请描述想怎么改")
+	}
+	// size 是**双模**语义（与方舟一致）：
+	//   像素写法 4096x4096 / 4096×4096 / 1024*1024 → 映射到「比例 + 档位」
+	//   档位写法 1K / 1.5K / 2K / 3K / 4K / auto → 只定档位，比例交上游
+	// 两种都解析不了才 400：静默按 1K 出图等于静默改账单。
+	if r.Size != "" {
+		if _, _, ok := parseWH(r.Size); !ok {
+			if _, ok := sizeAsTier(r.Size); !ok {
+				return nil, nil, badRequest("size", "invalid_request",
+					"size 要写成 宽x高（4096x4096、4096×4096、1024*1024）或档位（1K/2K/4K/auto）：%q", r.Size)
+			}
+		}
 	}
 	if r.Mask != "" {
 		return nil, nil, badRequest("mask", "unsupported_parameter",
@@ -250,7 +273,7 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 		warnings = append(warnings, fmt.Sprintf("n=%d 超过上游单次上限，已按 %d 张生成", r.N, maxSlots))
 	}
 
-	ratio, resolution := Shape(r.Size, r.Quality)
+	ratio, resolution := Shape(r.Size, r.Quality, defaultResolution)
 	// 客户端 UI 的「Auto」= 不指定档位，交给上游按 prompt 决定。
 	// 这是 MiniMax 客户端的默认档位：既不能当非法值 400，也不能静默换成
 	// 1:1 —— 用户选了「自动」却每张都是方图，比报错更难发现。
@@ -320,6 +343,15 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 	}
 
 	payload = map[string]any{"requests": items}
+	// 方舟协议的渠道字段：客户端会带，但 MiniMax 上游没有对应能力。
+	// 透传有被上游当未知参数拒绝的风险，静默丢弃又会让人以为生效了 ——
+	// 吞掉并点名。
+	for _, k := range arkOnlyKeys {
+		if _, ok := r.Extras[k]; ok {
+			delete(r.Extras, k)
+			warnings = append(warnings, k+" 上游不支持，已忽略")
+		}
+	}
 	// vendor extras 原样透传（同名冲突时不覆盖协议字段）。
 	for k, v := range r.Extras {
 		if _, exists := payload[k]; exists {
@@ -334,20 +366,71 @@ func (r *Request) Build() (payload map[string]any, warnings []string, perr *Prot
 //
 // 上游是"档位 × 比例"的矩阵，不是自由 WxH：档位 1K/2K/4K，比例见
 // upstreamRatios（实测十种）。所以自由像素必须先换算，换算不了就按最近档 —— 绝不能原样发。
-func Shape(size, quality string) (ratio, resolution string) {
-	ratio = ratioFromSize(size)
-	if ratio == "" {
-		ratio = "1:1"
+func Shape(size, quality, defaultResolution string) (ratio, resolution string) {
+	if tier, isTier := sizeAsTier(size); isTier {
+		// 档位写法（方舟协议）：比例不指定 —— 方舟的档位模式下像素与比例都由模型
+		// 按 prompt 判断，硬写 1:1 会让所有用 size="2K" 的客户端都拿到方图。
+		ratio, resolution = "", tier
+	} else {
+		ratio = ratioFromSize(size)
+		if ratio == "" {
+			ratio = "1:1"
+		}
+		resolution = resolutionFromSize(size)
 	}
 	switch strings.ToLower(strings.TrimSpace(quality)) {
 	case "hd", "high", "2k":
-		resolution = "2K"
+		return ratio, "2K"
 	case "4k", "ultra":
-		resolution = "4K"
-	default:
-		resolution = resolutionFromSize(size)
+		return ratio, "4K"
+	}
+	// 档位优先级：quality > size > 默认。size 解析不出来时交给 defaultResolution
+	// —— 以前这里硬回落 1K，导致配置项无法生效。
+	if resolution == "" {
+		resolution = NormalizeResolution(defaultResolution)
 	}
 	return ratio, resolution
+}
+
+// sizeAsTier 识别方舟协议的**档位写法**：size 可以直接写 1K / 1.5K / 2K / 3K / 4K / auto。
+//
+// 方舟的 size 是双模语义（档位或精确像素），MiniMax 只有 1K/2K/4K 三档，
+// 所以按长边吸附：1K→1K、1.5K(1536)→2K、2K→2K、3K(3072)→4K。
+// 返回 ok=true 表示「这是档位写法」；tier 为空表示 auto（不指定档位）。
+func sizeAsTier(size string) (string, bool) {
+	s := strings.ToUpper(strings.TrimSpace(size))
+	if s == "" {
+		return "", false
+	}
+	if s == "AUTO" {
+		return "", true
+	}
+	if !strings.HasSuffix(s, "K") {
+		return "", false
+	}
+	num, err := strconv.ParseFloat(strings.TrimSuffix(s, "K"), 64)
+	if err != nil || num <= 0 {
+		return "", false
+	}
+	return resolutionFromLongest(num * 1024), true
+}
+
+// NormalizeResolution 把配置里的默认档位规整成上游认识的写法。
+//
+// 空串 / "auto" = 不指定（整个 resolution 键都不下发，交上游决定）；
+// 其它无法识别的值回落 1K 而不是报错：配置错误不该让所有图片请求失败。
+func NormalizeResolution(v string) string {
+	switch s := strings.ToUpper(strings.TrimSpace(v)); s {
+	case "AUTO":
+		// 配置写 auto = 不下发 resolution 键，交上游按 prompt 决定。
+		return ""
+	case "2K", "4K":
+		return s
+	default:
+		// 空串（旧配置没有这个字段）与无法识别的值都按 1K：
+		// 升级后默认行为必须与升级前一致，配置写错也不该让请求全挂。
+		return "1K"
+	}
 }
 
 // upstreamRatios 是上游实测支持的比例（像素按 16 栅格对齐，比例本身是吸附值）。
@@ -469,7 +552,7 @@ func resolutionFromLongest(longest float64) string {
 func resolutionFromSize(size string) string {
 	w, h, ok := parseWH(size)
 	if !ok {
-		return "1K"
+		return ""
 	}
 	longest := w
 	if h > longest {
@@ -489,8 +572,15 @@ func ratioFromSize(size string) string {
 	return best
 }
 
+// sizeSeparators 归一化 size 里的乘号与空格。
+//
+// OpenAI 官方写法是 "1024x1024"，但中文文档、手写 curl 和部分客户端会写
+// "4096×4096" / "1024*1024" / "1024 X 1024"。这些如果只按 'x' 切，会解析失败，
+// 旧行为是静默回落 1K —— 用户以为要 4K，拿到的却是 1K。统一归一化后都认。
+var sizeSeparators = strings.NewReplacer("×", "x", "*", "x", "X", "x", " ", "")
+
 func parseWH(size string) (int, int, bool) {
-	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(size)), "x", 2)
+	parts := strings.SplitN(sizeSeparators.Replace(strings.TrimSpace(size)), "x", 2)
 	if len(parts) != 2 {
 		return 0, 0, false
 	}

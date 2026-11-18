@@ -25,6 +25,7 @@ import (
 // 上游模型名。
 const (
 	UpstreamH3     = "MiniMax-H3"
+	UpstreamH3Max  = "MiniMax-H3-Max"
 	UpstreamHailuo = "MiniMax-Hailuo-2.3"
 )
 
@@ -258,31 +259,15 @@ func (r *Request) Build() (payload map[string]any, upstreamModel string, warning
 	upstreamModel, ok := ResolveModel(r.Model)
 	if !ok {
 		return nil, "", nil, invalid("model", "unsupported_model",
-			"不支持的 model %q；可用：%s、%s（或别名 h3 / h2.3）", r.Model, UpstreamH3, UpstreamHailuo)
+			"不支持的 model %q；可用：%s、%s、%s（或别名 h3 / h3-max / h2.3）",
+			r.Model, UpstreamH3, UpstreamH3Max, UpstreamHailuo)
 	}
 
 	// 文本：拼成上游的单段 prompt。后缀参数在这里剥离并回填。
-	var texts []string
-	for _, it := range r.Content {
-		if it.Type != "text" {
-			continue
-		}
-		cleaned, params, warns := ParseSuffix(it.Text)
-		warnings = append(warnings, warns...)
-		if strings.TrimSpace(cleaned) != "" {
-			texts = append(texts, cleaned)
-		}
-		// 后缀回填：body 已有值则以 body 为准（强校验优先）。
-		for k, v := range params {
-			if w := r.applySuffix(k, v); w != "" {
-				warnings = append(warnings, w)
-			}
-		}
-	}
-	prompt := strings.TrimSpace(strings.Join(texts, "\n\n"))
-	if prompt == "" {
-		return nil, "", nil, invalid("content", "invalid_request",
-			"上游要求至少一段非空文本提示词（content[] 里的 type=text）")
+	prompt, pwarns, pperr := r.promptText()
+	warnings = append(warnings, pwarns...)
+	if pperr != nil {
+		return nil, "", nil, pperr
 	}
 
 	p := map[string]any{"model": upstreamModel, "prompt": prompt}
@@ -387,7 +372,7 @@ func (r *Request) Build() (payload map[string]any, upstreamModel string, warning
 		}
 	}
 	if r.Ratio != "" {
-		if upstreamModel == UpstreamH3 && r.Ratio == "adaptive" &&
+		if isH3Family(upstreamModel) && r.Ratio == "adaptive" &&
 			firstFrame == "" && len(refImages) == 0 && len(refVideos) == 0 {
 			return nil, "", nil, invalid("ratio", "invalid_request",
 				"%s 的文生视频必须给具体比例（21:9/16:9/4:3/1:1/3:4/9:16），不能用 adaptive", upstreamModel)
@@ -443,6 +428,196 @@ func (r *Request) Build() (payload map[string]any, upstreamModel string, warning
 	}
 	sort.Strings(warnings)
 	return p, upstreamModel, warnings, nil
+}
+
+// BuildSync 把 canonical 请求折成**同步**视频工具（上游 gen_videos）的单项载荷。
+//
+// 同步工具的能力面比异步窄，窄的地方必须拒绝并指路，不能悄悄降级：
+//   - 只声明 6/10 秒（异步的 H3 支持 4-15）；
+//   - 档位只声明 768P/1080P（H3 的 2K、H3-Max 的 480P 都不在里面）；
+//   - 只吃单张首帧，没有尾帧、没有全模态参考；
+//   - 没有 ratio / watermark / seed 这些参数。
+//
+// 为什么不暴露批量：上游 success_items 与请求之间没有可靠的索引对应，
+// 某一条失败时无法判定是哪一条 —— 把失败归错主比不做批量更糟。
+func (r *Request) BuildSync() (map[string]any, []string, *ProtocolError) {
+	upstreamModel, ok := ResolveModel(r.Model)
+	if !ok {
+		return nil, nil, invalid("model", "unsupported_model",
+			"不支持的 model %q；可用：%s、%s、%s（或别名 h3 / h3-max / h2.3）",
+			r.Model, UpstreamH3, UpstreamH3Max, UpstreamHailuo)
+	}
+
+	prompt, warnings, perr := r.promptText()
+	if perr != nil {
+		return nil, nil, perr
+	}
+
+	// 同步工具是"老视频工具"，只支持 Hailuo-2.3；H3 / H3-Max 必须走
+	// submit + query 两段式（上游 400 原文：legacy video tools support only
+	// `MiniMax-Hailuo-2.3`; use `matrix_submit_video_generation` … for `MiniMax-H3`）。
+	if upstreamModel != UpstreamHailuo {
+		return nil, nil, invalid("model", "unsupported_model",
+			"同步接口只支持 %s；%s 请改用 POST /v1/contents/generations/tasks（上游两段式）",
+			UpstreamHailuo, upstreamModel)
+	}
+
+	item := map[string]any{"prompt": prompt, "model": upstreamModel}
+
+	// 图片：同步工具只有「单张 + reference_type」一种形态。
+	var firstFrame string
+	for _, it := range r.Content {
+		switch it.Type {
+		case "image_url":
+			switch it.Role {
+			case "last_frame", "reference_image":
+				return nil, nil, invalid("content", "unsupported_parameter",
+					"同步接口只支持单张首帧；尾帧与全模态参考请改用 POST /v1/contents/generations/tasks")
+			}
+			if firstFrame != "" {
+				return nil, nil, invalid("content", "invalid_request",
+					"同步接口只接受一张图（首帧），收到多张")
+			}
+			firstFrame = it.ImageURL.URL
+		case "video_url", "audio_url":
+			return nil, nil, invalid("content", "unsupported_parameter",
+				"同步接口不支持参考视频/音频，请改用 POST /v1/contents/generations/tasks")
+		case "draft_task":
+			return nil, nil, invalid("content", "unsupported_parameter",
+				"上游不支持 draft_task（样片任务引用）")
+		}
+	}
+	if firstFrame != "" {
+		item["input_image"] = syncImageRef(firstFrame)
+		item["reference_type"] = "first_frame"
+	}
+
+	// 时长：同步工具只声明 6/10，比异步窄。
+	if r.Duration != nil {
+		d := *r.Duration
+		if d == -1 {
+			return nil, nil, invalid("duration", "unsupported_parameter",
+				"当前上游不支持 duration=-1（模型自选时长），请给具体秒数")
+		}
+		if d != 6 && d != 10 {
+			return nil, nil, invalid("duration", "unsupported_parameter",
+				"同步接口只支持 6 或 10 秒，收到 %d；%s 支持 4-15 秒，请改用 POST /v1/contents/generations/tasks",
+				d, upstreamModel)
+		}
+		item["duration"] = d
+	}
+
+	// 档位：同步工具只声明 768P/1080P。
+	res := ""
+	if r.Resolution != "" {
+		mapped, rperr := syncResolution(upstreamModel, r.Resolution)
+		if rperr != nil {
+			return nil, nil, rperr
+		}
+		res = mapped
+		if mapped != "" {
+			item["resolution"] = mapped
+		}
+	}
+	// Hailuo 的 1080P 只在 6 秒成立，1080P + 10s 上游会拒，提前拦。
+	if upstreamModel == UpstreamHailuo && res == "1080P" && r.Duration != nil && *r.Duration == 10 {
+		return nil, nil, invalid("duration", "invalid_request",
+			"%s 的 1080P 只支持 6 秒，10 秒必须用 768P", UpstreamHailuo)
+	}
+
+	// 同步工具没有这些参数：写了就必须告诉调用方，静默丢弃等于骗人。
+	skip := []struct {
+		cond bool
+		name string
+	}{
+		{r.Ratio != "", "ratio"},
+		{r.Watermark != nil, "watermark"},
+		{r.GenerateAudio != nil, "generate_audio"},
+		{r.CameraFixed != nil, "camera_fixed"},
+		{r.ReturnLastFrame != nil, "return_last_frame"},
+		{r.Seed != nil, "seed"},
+		{r.OutputFormat != "", "output_format"},
+		{r.Draft != nil, "draft"},
+		{r.ServiceTier != "", "service_tier"},
+		{r.CallbackURL != "", "callback_url"},
+		{r.ExecutionExpiresAfter != nil, "execution_expires_after"},
+		{r.Priority != nil, "priority"},
+		{r.SafetyIdentifier != "", "safety_identifier"},
+		{len(r.Tools) > 0, "tools"},
+		{r.OmniReferenceTaskType != "", "omni_reference_task_type"},
+	}
+	for _, sk := range skip {
+		if sk.cond {
+			warnings = append(warnings,
+				sk.name+" 同步接口不支持，已忽略（需要它请改用 POST /v1/contents/generations/tasks）")
+		}
+	}
+	sort.Strings(warnings)
+	return item, warnings, nil
+}
+
+// syncImageRef 把图片字符串折成同步工具的 {url|data} 信封。
+// http(s) 走 url；其余（data URI / 裸 base64）走 data。
+func syncImageRef(s string) map[string]any {
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return map[string]any{"url": s}
+	}
+	return map[string]any{"data": NormalizeDataURI(s)}
+}
+
+// syncResolution 把 canonical 档位换成本工具**声明**的档位。
+//
+// 注意这里与异步的差异不是笔误：同一个 1080p，H3 在异步里换成 2K，
+// 而同步工具没有 2K 档 —— 那就拒绝并指路，不能悄悄给个 768P。
+func syncResolution(model, want string) (string, *ProtocolError) {
+	switch want {
+	case "720p":
+		return "768P", nil
+	case "1080p":
+		if model == UpstreamHailuo {
+			return "1080P", nil
+		}
+		return "", invalid("resolution", "unsupported_parameter",
+			"%s 在同步接口里只有 768P 档；请改用 720p 或走异步任务", model)
+	case "480p":
+		return "", invalid("resolution", "unsupported_parameter",
+			"同步接口只声明 768P/1080P 档，没有 480p；%s 的 480P 请走异步任务", model)
+	case "4k":
+		return "", invalid("resolution", "unsupported_parameter",
+			"同步接口最高 1080P，4k 请改用异步任务")
+	}
+	return "", nil
+}
+
+// promptText 把 content[] 里的文本拼成上游的单段 prompt，并剥离/回填后缀参数。
+//
+// 抽出来是因为异步（Build）与同步（BuildSync）两条链路必须**同一套**归一化：
+// 两边各写一遍，后缀就迟早会在其中一条上漏剥，被模型当画面文字读出来。
+func (r *Request) promptText() (string, []string, *ProtocolError) {
+	var texts []string
+	var warnings []string
+	for _, it := range r.Content {
+		if it.Type != "text" {
+			continue
+		}
+		cleaned, params, warns := ParseSuffix(it.Text)
+		warnings = append(warnings, warns...)
+		if strings.TrimSpace(cleaned) != "" {
+			texts = append(texts, cleaned)
+		}
+		// 后缀回填：body 已有值则以 body 为准（强校验优先）。
+		for k, v := range params {
+			if w := r.applySuffix(k, v); w != "" {
+				warnings = append(warnings, w)
+			}
+		}
+	}
+	prompt := strings.TrimSpace(strings.Join(texts, "\n\n"))
+	if prompt == "" {
+		return "", nil, invalid("content", "invalid_request",
+			"上游要求至少一段非空文本提示词（content[] 里的 type=text）")
+	}
+	return prompt, warnings, nil
 }
 
 // applySuffix 把一个后缀参数写回请求；返回非空表示需要提示的 warning。
@@ -557,7 +732,9 @@ func ParseSuffix(text string) (clean string, params map[string]string, warnings 
 // ResolveModel 把客户端模型名映射成上游模型。
 func ResolveModel(m string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(m)) {
-	case "minimax-h3", "h3", "minimax-h3-max", "h3-max":
+	case "minimax-h3-max", "h3-max", "minimax-h3-max-fast":
+		return UpstreamH3Max, true
+	case "minimax-h3", "h3":
 		return UpstreamH3, true
 	case "minimax-hailuo-2.3", "hailuo-2.3", "h2.3", "minimax-hailuo-23", "hailuo":
 		return UpstreamHailuo, true
@@ -565,23 +742,44 @@ func ResolveModel(m string) (string, bool) {
 	return "", false
 }
 
+// isH3Family 判断是否 H3 系（H3 / H3-Max）：两者共享"文生视频必须给具体比例"这条规则。
+func isH3Family(model string) bool {
+	return model == UpstreamH3 || model == UpstreamH3Max
+}
+
 // mapResolution 把 canonical 档位换成上游档位。
-// 上游只有 768P/1080P/2K，480p 没有对应档且换档会改变账单 —— 直接拒绝。
+//
+// 三个型号的档位面各不相同，换档会改变账单，所以越界一律 400，绝不回落默认：
+//
+//	MiniMax-H3      768P / 2K
+//	MiniMax-H3-Max  480P / 768P（没有 2K，1080p 与 4k 都无对应档）
+//	Hailuo-2.3      768P（6/10s）/ 1080P（仅 6s）
 func mapResolution(model, want string) (mapped string, warning string, perr *ProtocolError) {
 	switch want {
 	case "480p":
+		if model == UpstreamH3Max {
+			return "480P", "", nil
+		}
 		return "", "", invalid("resolution", "unsupported_parameter",
-			"上游最低档是 768P，没有 480p；请改用 720p")
+			"%s 的最低档是 768P，没有 480p；请改用 720p", model)
 	case "720p":
 		return "768P", "", nil
 	case "1080p":
-		if model == UpstreamH3 {
+		switch model {
+		case UpstreamH3:
 			return "2K", "1080p 已换算为 " + UpstreamH3 + " 支持的 2K 档", nil
+		case UpstreamH3Max:
+			return "", "", invalid("resolution", "unsupported_parameter",
+				UpstreamH3Max+" 只支持 480P/768P，没有 1080p 档；请改用 720p 或换 "+UpstreamH3)
 		}
 		return "1080P", "", nil
 	case "4k":
-		if model == UpstreamH3 {
+		switch model {
+		case UpstreamH3:
 			return "2K", "4k 超出 " + UpstreamH3 + " 上限，已换算为 2K", nil
+		case UpstreamH3Max:
+			return "", "", invalid("resolution", "unsupported_parameter",
+				UpstreamH3Max+" 最高 768P，没有 4k 档；请改用 720p 或换 "+UpstreamH3)
 		}
 		return "1080P", "4k 超出 " + UpstreamHailuo + " 上限，已换算为 1080P", nil
 	}
@@ -589,10 +787,17 @@ func mapResolution(model, want string) (mapped string, warning string, perr *Pro
 }
 
 func validateDuration(model string, d int) *ProtocolError {
-	if model == UpstreamH3 {
+	switch model {
+	case UpstreamH3:
 		if d < 4 || d > 15 {
 			return invalid("duration", "invalid_request",
 				"%s 的 duration 支持 4-15 秒，收到 %d", UpstreamH3, d)
+		}
+		return nil
+	case UpstreamH3Max:
+		if d < 5 || d > 15 {
+			return invalid("duration", "invalid_request",
+				"%s 的 duration 支持 5-15 秒，收到 %d", UpstreamH3Max, d)
 		}
 		return nil
 	}

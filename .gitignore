@@ -18,3 +18,6 @@ config.json
 
 # 部署机密（生产密钥，绝不入库）
 deploy/ai-prod/.env
+
+# 真调测试产物（19MB 图片，含单张 14MB 4K 图），只留在本地
+/docs/i2i-test/
