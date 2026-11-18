@@ -1,0 +1,362 @@
+# 发版流水线 —— 混合模型
+#
+#   push main            → 自动 patch 自增（v0.5.0 → v0.5.1），写回版本常量后打 tag、发 Release、推镜像
+#   push v*.*.* tag      → 用该 tag 发版，不再递增（版本号由人决定）
+#   workflow_dispatch    → 按已有 tag 补发（用于失败重跑 / 漏发）
+#
+# 改动前必须知道的五条约束（均为此前实测踩出来的）：
+#   1. 版本号的唯一权威是 git tag，但 /healthz 读的是 internal/server/server.go 的 const Version，
+#      两者必须由 bump 步骤强制对齐，否则镜像"自报版本"会与 tag 脱节。
+#   2. 镜像先推、git tag 后打：构建失败不会留下"有 tag、没镜像"的半成品。
+#   3. GITHUB_TOKEN 推送的提交与标签不会触发任何 workflow ⇒ bump 提交不会自激；仍保留 actor 守卫兜底。
+#   4. 并发按 ref 串行；同一 push 被重复投递时，靠"HEAD 已被最新 tag 覆盖"判定第二次直接跳过，
+#      否则会连发两个版本（实测过 v0.1.3 / v0.1.4 双发）。
+#   5. 冒烟在 push 之前跑：镜像在本地起来验过 /healthz 与鉴权契约才允许进 GHCR。
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要补发的 tag（必须已存在，如 v0.5.1）'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # 打 tag、建 Release
+  packages: write   # 推 ghcr
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/rsfree/minimaxcode2api
+  GO_VERSION: '1.25'
+  VERSION_FILE: internal/server/server.go
+
+jobs:
+  # ── 1. 解析模式与版本 ─────────────────────────────────────────────────────
+  resolve:
+    # actor 守卫：将来若把 GITHUB_TOKEN 换成 PAT，bump 提交也不会自激
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      commit: ${{ steps.ver.outputs.commit }}
+      changelog: ${{ steps.log.outputs.body }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 三条入口各取各的 ref：补发取 inputs.tag、tag 推送取 github.ref、push main 取 github.sha。
+          # ⚠️ 分支 push 绝不能用 github.ref（移动指针）：构建要几分钟，期间再有 push 就会把 tag
+          #    打到"不是本次触发发布"的提交上。
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message || '' }}
+          INPUT_TAG: ${{ inputs.tag || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MODE=auto
+          TAG=""
+          PREV=""
+
+          if [ -n "$INPUT_TAG" ]; then
+            MODE=tag; TAG="$INPUT_TAG"
+            git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null \
+              || { echo "::error::tag ${TAG} 不存在，无法补发"; exit 1; }
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            MODE=tag; TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          if [ "$MODE" = tag ]; then
+            VERSION="${TAG#v}"
+            PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null || true)
+          else
+            PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+            BASE="${PREV:-v0.0.0}"
+            CORE="${BASE#v}"
+            MAJOR="${CORE%%.*}"; REST="${CORE#*.}"
+            MINOR="${REST%%.*}"; PATCH="${REST#*.}"
+            PATCH="${PATCH%%[-+]*}"          # 预发布后缀会打断 $(( )) 算术
+            VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            TAG="v${VERSION}"
+          fi
+
+          # 逃生阀：整条 message 匹配（不是只匹配标题）
+          if [[ "$HEAD_MSG" == *'[skip release]'* ]]; then
+            echo "::notice::commit message 命中逃生阀，跳过发版"
+            MODE=skip
+          fi
+
+          # 重复投递去重：HEAD 已被最新版本 tag 覆盖 ⇒ 本次是同一批推送的第二次投递
+          if [ "$MODE" = auto ] && [ -n "$PREV" ] && git merge-base --is-ancestor "$GITHUB_SHA" "$PREV"; then
+            if gh release view "$PREV" >/dev/null 2>&1; then
+              echo "::notice::HEAD 已被 $PREV 覆盖且 Release 已存在，跳过（重复投递）"
+              MODE=skip; TAG="$PREV"; VERSION="${PREV#v}"
+            else
+              echo "::error::$PREV 已存在但 Release 缺失，流水线停在上次失败处；请用 workflow_dispatch -f tag=$PREV 补发"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "mode=$MODE"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prev=$PREV"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE tag=$TAG version=$VERSION prev=${PREV:-<none>}"
+
+      - name: Build changelog
+        id: log
+        if: ${{ steps.ver.outputs.mode != 'skip' }}
+        env:
+          MODE: ${{ steps.ver.outputs.mode }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          PREV: ${{ steps.ver.outputs.prev }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = tag ]; then
+            if [ -n "$PREV" ]; then RANGE="${PREV}..${TAG}"; else RANGE="${TAG}"; fi
+          else
+            if [ -n "$PREV" ]; then RANGE="${PREV}..HEAD"; else RANGE="HEAD"; fi
+          fi
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo '## Changes'
+            git log "$RANGE" --max-count=50 --pretty='- %s (%h)' --no-merges || echo '- Initial release'
+            echo ''
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${TAG}"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+  # ── 2. 测试（逃生阀命中时也照跑，别让"跳过发版"变成"连测试都不跑"） ──────
+  test:
+    needs: resolve
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false        # 仓库零依赖、无 go.sum，开缓存会因找不到依赖文件报错
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+
+  # ── 3. 版本写回（仅 auto 模式） ───────────────────────────────────────────
+  bump:
+    needs: [resolve, test]
+    if: ${{ needs.resolve.outputs.mode == 'auto' }}
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.bump.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+      - name: Rewrite Version const and push
+        id: bump
+        env:
+          V: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          hits=$(grep -c '^const Version = "' "$VERSION_FILE" || true)
+          [ "$hits" = "1" ] || { echo "::error::$VERSION_FILE 里应有 1 处 const Version，实际 $hits"; exit 1; }
+
+          if grep -q "^const Version = \"$V\"$" "$VERSION_FILE"; then
+            echo "::notice::版本已是 ${V}，跳过提交（幂等）"
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          perl -0pi -e "s/^const Version = \"[^\"]*\"/const Version = \"$V\"/m" "$VERSION_FILE"
+          grep -q "^const Version = \"$V\"$" "$VERSION_FILE" \
+            || { echo "::error::写回失败，$VERSION_FILE 未含期望版本 $V"; exit 1; }
+
+          git commit -am "chore(release): v${V} [skip release]"
+
+          # detached HEAD 上没有本地 main 分支，只能推 HEAD:main
+          git pull --rebase origin main
+          grep -q "^const Version = \"$V\"$" "$VERSION_FILE" \
+            || { echo "::error::rebase 后版本常量被改动，请人工检查冲突"; exit 1; }
+
+          git push origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ── 4. 构建 + 冒烟 + 推镜像（冒烟不过不进 registry） ─────────────────────
+  ship:
+    needs: [resolve, bump]
+    # bump 在 tag 模式会被 skip，必须用 always() 绕开"依赖被 skip 则级联 skip"
+    if: ${{ always() && needs.resolve.result == 'success' && needs.resolve.outputs.mode != 'skip' && needs.bump.result != 'failure' && needs.bump.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.commit || needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            GOOS=${target%%/*}; GOARCH=${target##*/}
+            stage="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags '-s -w' \
+              -o "$stage/minimaxcode2api" ./cmd/server
+            cp README.md .env.example "$stage/"
+            tar -czf "dist/minimaxcode2api_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "$stage" .
+            rm -rf "$stage"
+          done
+          ( cd dist && sha256sum ./*.tar.gz > SHA256SUMS )
+          ls -la dist
+
+      - name: Verify dist/
+        run: |
+          set -euo pipefail
+          [ -n "$(ls -A dist)" ] || { echo "::error::dist/ 为空"; exit 1; }
+
+      - name: Build image
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse --short=7 HEAD)
+          docker build \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA}" .
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Smoke test image
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          PORT=17864
+          KEY=sk-smoke-$(date +%s)
+          cleanup() { docker logs mmx2a-smoke 2>&1 | tail -40 || true; docker rm -f mmx2a-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          docker run -d --name mmx2a-smoke -p "127.0.0.1:${PORT}:7864" \
+            -e MMX2A_API_KEY="$KEY" -e MMX2A_ADMIN_PASSWORD=smoke-admin \
+            "${IMAGE}:${VERSION}" >/dev/null
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PORT}/healthz" -o /tmp/hz.json 2>/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "::error::30s 内 /healthz 未就绪"; exit 1; }
+
+          # ① 自报版本必须等于发布版本（证明 bump 真的进了镜像）
+          python3 - "$VERSION" <<'PY'
+          import json,sys
+          v=sys.argv[1]
+          d=json.load(open('/tmp/hz.json'))
+          assert d.get('version')==v, f"healthz version={d.get('version')} != {v}"
+          print("healthz version OK:", v)
+          PY
+
+          # ② 无 key 必须 401（鉴权真的接线）
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v1/models")
+          [ "$code" = 401 ] || { echo "::error::无 key /v1/models 期望 401，实际 $code"; exit 1; }
+
+          # ③ 带 key 必须 200
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${KEY}" \
+            "http://127.0.0.1:${PORT}/v1/models")
+          [ "$code" = 200 ] || { echo "::error::带 key /v1/models 期望 200，实际 $code"; exit 1; }
+
+          echo "smoke OK"
+
+      - name: Push image (three tags, one build)
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${SHA}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ needs.resolve.outputs.version }}
+          path: dist/
+          retention-days: 30
+
+  # ── 5. 打 tag + 建 Release（镜像已经在了，才轮到 git 侧） ─────────────────
+  release:
+    needs: [resolve, ship]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.ship.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.commit || needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist-${{ needs.resolve.outputs.version }}
+          path: dist
+
+      - name: Create tag
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} 已存在，跳过创建"
+            exit 0
+          fi
+          if [ "$MODE" != auto ]; then
+            echo "::notice::tag 模式，tag 由使用者创建，跳过"
+            exit 0
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          BODY: ${{ needs.resolve.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，跳过创建（可重入）"
+            exit 0
+          fi
+          printf '%s\n' "$BODY" > /tmp/notes.md
+          gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md dist/*

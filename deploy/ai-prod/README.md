@@ -6,7 +6,7 @@
 |---|---|
 | 机器 | `210.121.44.245`（首尔 AS9848），root + `~/.ssh/id_ed25519_ops` |
 | 服务目录 | `/opt/minimaxcode2api/`（`src/` 源码、`data/` 运行时、`nginx/` 脚本与片段） |
-| 容器 | `minimaxcode2api:0.5.0`，`restart: unless-stopped`，非 root（uid 10001） |
+| 容器 | `ghcr.io/rsfree/minimaxcode2api:<IMAGE_TAG>`（CI 发布），`restart: unless-stopped`，非 root（uid 10001） |
 | 监听 | **仅回环** `127.0.0.1:39350` → 容器 `7864` |
 | 入口 | 宝塔 nginx：`:80` 一律 301 → `:443` 反代回环 |
 | 证书 | `/www/server/panel/vhost/cert/minimaxcode.1task.cn/`（acme.sh，到期 2027-02-09，自动续期） |
@@ -61,6 +61,27 @@ ssh ... '/www/server/nginx/sbin/nginx -s reload'
 ssh ... 'cd /opt/minimaxcode2api/nginx && nohup env HOST=minimaxcode.1task.cn bash apply-https.sh > /tmp/mmx2a-https.log 2>&1 &'
 ```
 
+## 发版（CI）
+
+`.github/workflows/release.yml` 是混合模型：
+
+| 触发 | 行为 |
+|---|---|
+| push `main` | 自动 patch 自增（0.5.0 → 0.5.1），写回 `const Version`、打 tag、建 Release、推 GHCR |
+| push `v*.*.*` tag | 用该版本发版，不再递增 |
+| Actions → Release → Run workflow（填 tag） | 按已有 tag 补发（失败重跑 / 漏发） |
+
+一次构建产出三份同 digest 镜像：`:<版本>` / `:latest` / `:sha-<短SHA>`；Release 附
+linux/amd64、linux/arm64、darwin/arm64 三个 tar.gz 与 SHA256SUMS。推镜像之前会先在 runner
+上起容器冒烟（`/healthz` 自报版本 == 发布版本、无 key 401、带 key 200），不过不推。
+
+三条已知边界：
+
+- **单平台 linux/amd64**：不跑多架构构建，arm64 节点仍需本地 `docker build`（Dockerfile 未改）。
+- **版本号唯一权威是 git tag**：代码里的 `const Version` 由 CI 写回，手工改会被下次发版覆盖。
+- **包默认可能是私有**：节点首次 `docker pull` 前需 `docker login ghcr.io`（PAT 带 `read:packages`），
+  或把包可见性改成 public（组织需先允许 Public；单向门，改不回私有）。
+
 ## 日常运维
 
 ```bash
@@ -72,10 +93,9 @@ journalctl 不用看，容器日志已限到 3×20MB
 # 改配置（热生效，不用重启）：改 data/config.json 后 PUT 面板设置，或直接编辑文件后重启容器
 docker restart minimaxcode2api
 
-# 升级：改完代码 push → 服务器重新拉包重建
-git archive --format=tar.gz --prefix=src/ -o /tmp/mmx2a-src.tgz HEAD
-scp ... ; ssh ... 'tar -xzf ... && cd /opt/minimaxcode2api/src && docker build -t minimaxcode2api:<新版本> .'
-# 改 compose 里的 image tag → docker compose up -d（会重建容器，数据在 ./data 挂载里不受影响）
+# 升级 / 回滚：节点只拉镜像，不再本地构建（数据在 ./data 挂载里不受影响）
+cd /opt/minimaxcode2api && ./update.sh 0.5.1     # 写 IMAGE_TAG → pull → up -d → 等 /healthz
+./update.sh 0.5.0                                 # 回滚：换成上一版本再跑一次
 ```
 
 ## 🔴 两个只有实操才会发现的坑

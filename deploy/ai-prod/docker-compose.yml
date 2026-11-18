@@ -1,13 +1,20 @@
 # minimaxcode2api @ ai-prod（210.121.44.245）
 #
-# 部署方式：服务器构建（GHCR 上没有镜像，仓库也没有 Actions 流水线）。
-# 构建：cd /opt/minimaxcode2api/src && docker build -t minimaxcode2api:0.5.0 .
-# 起服务：cd /opt/minimaxcode2api && docker compose up -d
+# 部署方式：拉 CI 发布到 GHCR 的镜像（一次构建出 <版本> / latest / sha-<短SHA> 三个 tag）。
+# 升级：cd /opt/minimaxcode2api && ./update.sh <版本>   → 写 IMAGE_TAG、pull、up -d、等 /healthz
+# 回滚：./update.sh <上一版本>
 #
-# 密钥不写在文件里：同目录 .env（chmod 600）提供 MMX2A_API_KEY / MMX2A_ADMIN_PASSWORD。
+# 🟡 首次从"服务器本地构建"切到"拉镜像"时二选一：
+#     a) 把 GHCR 包可见性改为 public（组织 Settings → Packages 需先允许 Public；单向门，改不回私有）
+#     b) 节点上 docker login ghcr.io（PAT 需 read:packages）
+#    否则 pull 会 401/403。
+#
+# 密钥不写在文件里：同目录 .env（chmod 600）提供 MMX2A_API_KEY / MMX2A_ADMIN_PASSWORD，
+# 另由 update.sh 维护 IMAGE_TAG。
 services:
   minimaxcode2api:
-    image: minimaxcode2api:0.5.0
+    # 版本由 .env 的 IMAGE_TAG 显式钉住，不用 latest 隐式漂移
+    image: ghcr.io/rsfree/minimaxcode2api:${IMAGE_TAG:-latest}
     container_name: minimaxcode2api
     restart: unless-stopped
 
