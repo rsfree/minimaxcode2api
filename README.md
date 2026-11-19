@@ -193,6 +193,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `pool.max_in_flight` / `max_in_flight_per_account` | 总闸门 / 单账号在途上限 |
 | `pool.cooldown_429` / `cooldown_429_max` | 429 指数退避（封顶） |
 | `pool.cooldown_5xx` | 5xx 冷却；401/403 取它的 2 倍 |
+| `pool.cooldown_billing` / `cooldown_billing_max` | 402 额度不足的独立退避（默认 5m → 30m 封顶）。与 429 分开配置：429 是秒级频控，402 是 5h/周窗口或积分耗尽，量级差两个数量级 |
 | `pool.breaker_failures` / `breaker_cooldown` | 连续失败熔断 |
 | `pool.refresh_before` | 提前多久刷新 token（默认 10 分钟） |
 | `defaults.model` / `max_tokens` / `thinking_policy` | 未显式指定时的缺省值 |
