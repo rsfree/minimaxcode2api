@@ -66,14 +66,15 @@ docker compose up -d --build
 
 ## 发版
 
-两条路，产物一致：
+发版由 `.github/workflows/release.yml` 负责，仓库是 `rsfree/minimaxcode2api`：
 
-- **CI（默认）**：push 到 `main` 即 patch 自增发版；要 major/minor 就人工 `git tag -a vX.Y.Z && git push origin vX.Y.Z`；给已有 tag 补发用 `gh workflow run release.yml -f tag=vX.Y.Z`。
-- **本地（Actions 不可用时）**：`./scripts/release.sh`，`-t vX.Y.Z` 指定版本，`--no-push` 只构建 + 冒烟。
+- **push 到 `main`**：patch 自增（如 `v0.5.1` → `v0.5.2`），自动把 `internal/server/server.go` 的 `const Version` 写回成新版本并提交，然后打 tag、发 Release、推镜像。
+- **人工打 tag**：`git tag -a vX.Y.Z && git push origin vX.Y.Z`，按该版本发布，不再递增（major/minor 由人决定）。
+- **补发**：`gh workflow run release.yml -f tag=vX.Y.Z`，用于失败重跑或漏发。
 
-产物是 `linux/amd64` 二进制（tar.gz + sha256）与 `ghcr.io/yuanjie-ai/minimaxcode2api` 的三个 tag（`<version>` / `latest` / `sha-<7位>`），外加一个 GitHub Release。纯文档提交在 commit message 里带 `[skip release]` 可跳过发版。
+产物：三个平台的 tar.gz（linux/amd64、linux/arm64、darwin/arm64）+ `SHA256SUMS`，以及 `ghcr.io/rsfree/minimaxcode2api` 的三个镜像 tag（`<version>` / `latest` / `sha-<7位>`）。纯文档提交在 commit message 里带 `[skip release]` 可跳过发版（测试照跑）。
 
-版本号由构建期 `-ldflags -X .../internal/server.Version` 注入，所以 `internal/server/server.go` 里的 `Version` 必须是 `var`；源码里的字面量只是本地 `go build` 的兜底值。
+版本号的唯一权威是 git tag，`const Version` 由 bump 步骤强制对齐；改版本相关代码时别把它换成 `var` 或加构建期注入，否则 bump 会失败。
 
 ## 账号怎么来（重要）
 
