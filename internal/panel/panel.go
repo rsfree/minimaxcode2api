@@ -45,6 +45,10 @@ type Deps struct {
 	// 面板本身不碰凭据生命周期 —— 否则会和主链路抢同一把 refresh_token。
 	Quota func(ctx context.Context, acct store.Account) (*quota.ImageFree, error)
 
+	// Plan 取某账号的套餐 / 积分 / 5 小时·周窗口快照。同样是**另一组池子**，
+	// 与 Quota 无换算关系（见 internal/quota/plan.go 的口径表）。
+	Plan func(ctx context.Context, acct store.Account) (*quota.Plan, error)
+
 	// 以下由 server 注入：面板只做展示，业务逻辑（token 刷新、上游查询、
 	// 领取签到）留在 server —— 面板再造一份必然和主链路分叉。
 	VideoTasks     *videotask.Store
@@ -157,58 +161,102 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			"enabled": enabled,
 			"cooling": cooling,
 		},
-		"today":     p.d.Usage.Today(),
-		"all_time":  p.d.Usage.AllTime(),
+		"today":    p.d.Usage.Today(),
+		"all_time": p.d.Usage.AllTime(),
 		// 媒体调用（图片/视频/音频）按次数单列：它们没有 token，
 		// 并进 today.requests 会让"今日请求"看起来暴涨而 token 不动。
 		"media_today":    p.d.Usage.TodayMedia(),
 		"media_all_time": p.d.Usage.AllTimeMedia(),
-		"models":    cfg.Models.Expose,
-		"base_url":  cfg.Upstream.BaseURL,
-		"listen":    cfg.Listen,
-		"endpoints": []string{"/v1/chat/completions", "/v1/messages", "/v1/models"},
-		"strategy":  cfg.Pool.Strategy,
-		"logs":      p.d.Logs.Len(),
+		"models":         cfg.Models.Expose,
+		"base_url":       cfg.Upstream.BaseURL,
+		"listen":         cfg.Listen,
+		"endpoints":      []string{"/v1/chat/completions", "/v1/messages", "/v1/models"},
+		"strategy":       cfg.Pool.Strategy,
+		"logs":           p.d.Logs.Len(),
 	})
 }
 
-// quota 返回各账号的「图片生成免费额度」。
+// quota 返回各账号的额度快照，三组池子并列展示：
 //
-// 口径说明：这是**次数**池（限时免费 10 次），与 5 小时/周窗口、积分余额都不是
-// 同一个池子。所以它只做展示，不参与调度决策 —— 拿它判断"还能不能生成"会错。
+//	图片免费次数  次数池（限时活动 10 次）—— 与另外两个都不是一回事
+//	token plan    tp_remains + 套餐档位 + 到期时间
+//	积分 credits   签到 / 活动发的 op_credits
+//	5h / 周窗口    频控百分比（打满会 402，但 tp_remains 仍可能为正）
+//
+// 口径互不换算，绝不合并成一个"总余额"：三者的单位与失效条件都不同，
+// 合并只会让用户误判"还有钱为什么报错"。
+//
+// 账号之间**并发**取数：串行时 5 个账号 × 两个 6-8s 超时会把首屏拖到 40s+。
 func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
 	accounts := p.d.Store.List()
-	out := make([]map[string]any, 0, len(accounts))
-	anyActive := false
+	targets := make([]store.Account, 0, 5)
 	for _, a := range accounts {
 		if a.Disabled {
 			continue
 		}
-		// 多了会拖慢概览（每个账号一次上游往返），只展示前 5 个。
-		if len(out) >= 5 {
+		// 多了会拖慢概览（每个账号两次上游往返），只展示前 5 个。
+		if len(targets) >= 5 {
 			break
 		}
-		item := map[string]any{"id": a.ID, "label": firstNonEmpty(a.Label, a.ID)}
-		if p.d.Quota == nil {
-			item["error"] = "额度接口未配置"
-			out = append(out, item)
-			continue
+		targets = append(targets, a)
+	}
+
+	out := make([]map[string]any, len(targets))
+	var wg sync.WaitGroup
+	for i := range targets {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a := targets[i]
+			item := map[string]any{"id": a.ID, "label": firstNonEmpty(a.Label, a.ID)}
+			if p.d.Quota == nil {
+				item["error"] = "额度接口未配置"
+			} else if q, err := p.d.Quota(r.Context(), a); err != nil {
+				item["error"] = err.Error()
+			} else if q != nil {
+				item["total"] = q.Total
+				item["used"] = q.Used
+				item["remaining"] = q.Remaining
+				item["active"] = q.Active
+				item["fetched_at"] = q.FetchedAt.Local().Format("2006-01-02 15:04:05")
+			}
+			if p.d.Plan != nil {
+				if plan, err := p.d.Plan(r.Context(), a); err != nil {
+					item["plan"] = map[string]any{"membership_error": err.Error()}
+				} else if plan != nil {
+					item["plan"] = planBody(plan)
+				}
+			}
+			out[i] = item
+		}(i)
+	}
+	wg.Wait()
+
+	anyActive := false
+	for _, it := range out {
+		if v, ok := it["active"].(bool); ok && v {
+			anyActive = true
 		}
-		q, err := p.d.Quota(r.Context(), a)
-		switch {
-		case err != nil:
-			item["error"] = err.Error()
-		case q != nil:
-			item["total"] = q.Total
-			item["used"] = q.Used
-			item["remaining"] = q.Remaining
-			item["active"] = q.Active
-			item["fetched_at"] = q.FetchedAt.Local().Format("2006-01-02 15:04:05")
-			anyActive = anyActive || q.Active
-		}
-		out = append(out, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "any_active": anyActive})
+}
+
+// planBody 把快照摊平成前端契约。两个池的错误分开给：一个挂了另一个照常显示。
+func planBody(p *quota.Plan) map[string]any {
+	body := map[string]any{}
+	if p.Membership != nil {
+		body["membership"] = p.Membership
+	}
+	if p.MembershipError != "" {
+		body["membership_error"] = p.MembershipError
+	}
+	if p.Window != nil {
+		body["window"] = p.Window
+	}
+	if p.WindowError != "" {
+		body["window_error"] = p.WindowError
+	}
+	return body
 }
 
 // ---------- 账号 ----------

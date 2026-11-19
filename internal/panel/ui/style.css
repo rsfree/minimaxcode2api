@@ -372,7 +372,7 @@ tbody tr:hover { background: var(--surface-2); }
 .badge.accent { background: var(--accent-weak); color: var(--accent); }
 
 /* ---------- 图片生成额度 ---------- */
-.quota-list { display: flex; flex-direction: column; gap: 10px; }
+.quota-list { display: flex; flex-direction: column; gap: 14px; }
 .quota-row { display: flex; align-items: center; gap: 12px; font-size: 13px; }
 .quota-row .q-name { min-width: 150px; }
 .quota-row .q-bar {
@@ -389,6 +389,7 @@ tbody tr:hover { background: var(--surface-2); }
   border-radius: 999px;
   transition: width .3s var(--ease);
 }
+.quota-row .q-bar.warn > i { background: var(--err); }
 .quota-row .q-num {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
@@ -396,6 +397,40 @@ tbody tr:hover { background: var(--surface-2); }
   white-space: nowrap;
 }
 .quota-row .q-err { color: var(--err); font-size: 12.5px; }
+
+/* 单账号额度块：标题行 + 两个数字 + 两条窗口进度条 + 次数池 */
+.q-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed var(--border);
+}
+.q-block:last-child { border-bottom: 0; padding-bottom: 0; }
+.q-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.q-head .q-name { font-size: 13.5px; font-weight: 600; }
+.q-tag {
+  font-size: 11.5px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 9px;
+  white-space: nowrap;
+}
+.q-metrics { display: flex; gap: 26px; flex-wrap: wrap; }
+.q-metric { display: flex; flex-direction: column; gap: 2px; }
+.q-metric-k { font-size: 11.5px; color: var(--muted); }
+.q-metric-v { font-size: 17px; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.quota-row .q-k { min-width: 84px; color: var(--muted); font-size: 12.5px; flex: none; }
+.quota-row .q-v {
+  min-width: 132px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.q-sub { font-size: 12px; color: var(--muted); }
 
 .kv-list { display: flex; flex-direction: column; gap: 10px; }
 .kv {

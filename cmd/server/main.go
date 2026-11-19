@@ -71,6 +71,7 @@ func main() {
 		Version: server.Version,
 		Start:   time.Now(),
 		Quota:   srv.ImageQuotaForAccount,
+		Plan:    srv.PlanForAccount,
 
 		VideoTasks:     srv.VideoTasks,
 		SigninStatus:   srv.SigninStatus,

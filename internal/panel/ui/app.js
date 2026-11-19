@@ -227,7 +227,8 @@
     }
   }
 
-  // 图片生成额度：次数池，读不到就只显示原因，绝不影响概览其它部分。
+  // 账号额度：三组池子并列（图片免费次数 / token plan + 积分 / 5h·周窗口）。
+  // 它们互不换算，也**不能**合并成一个"总余额"—— 单位与失效条件都不同。
   async function loadQuota() {
     const card = $('#quota-card');
     if (!card) return;
@@ -243,6 +244,115 @@
     }
   }
 
+  // pctNum 把上游的 "12%" / 12 归一成数字；解析不出来的返回 null（不假装是 0）。
+  const pctNum = (s) => {
+    const m = String(s == null ? '' : s).match(/-?\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : null;
+  };
+
+  const bar = (pct, warn) => {
+    const wrap = el('div', 'q-bar' + (warn ? ' warn' : ''));
+    const fill = el('i');
+    const v = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    fill.style.width = v + '%';
+    wrap.appendChild(fill);
+    return wrap;
+  };
+
+  const fmtDay = (ms) => {
+    const n = Number(ms) || 0;
+    if (!n) return '';
+    const d = new Date(n);
+    if (isNaN(d)) return '';
+    const p = (x) => String(x).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  };
+
+  const fmtNumTight = (n) => {
+    n = Number(n) || 0;
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + ' 亿';
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + ' 万';
+    return n.toFixed(0);
+  };
+
+  function windowRow(label, pctStr, endMs) {
+    const row = el('div', 'quota-row');
+    row.appendChild(el('span', 'q-k', label));
+    const p = pctNum(pctStr);
+    row.appendChild(bar(p, p != null && p >= 90));
+    const left = endMs ? ` · ${fmtLeft((Number(endMs) - Date.now()) / 1000)} 后重置` : '';
+    row.appendChild(el('span', 'q-v mono', (p == null ? '—' : p + '%') + left));
+    return row;
+  }
+
+  function quotaBlock(q) {
+    const wrap = el('div', 'q-block');
+    const plan = q.plan || {};
+    const m = plan.membership;
+
+    const head = el('div', 'q-head');
+    head.appendChild(el('span', 'q-name', q.label || q.id));
+    if (m) {
+      const tag = el('span', 'q-tag');
+      const exp = fmtDay(m.expires_at_ms);
+      if (m.tier) {
+        tag.textContent = exp ? `${m.tier} 套餐 · ${exp} 到期` : `${m.tier} 套餐`;
+      } else {
+        // 免费账号：plan_name 可能是"免费"，也可能是空串。
+        tag.textContent = m.plan_name ? String(m.plan_name) : '无 token plan';
+      }
+      head.appendChild(tag);
+    }
+    wrap.appendChild(head);
+
+    // token plan 与积分：同一端点取回，但显示成两个独立数字（单位不同）。
+    // 免费账号两者都可能为空 —— 空就不显示，不编 0。
+    if (m) {
+      const grid = el('div', 'q-metrics');
+      if (m.has_token_plan) {
+        const tp = el('div', 'q-metric');
+        tp.appendChild(el('span', 'q-metric-k', 'token plan 余额'));
+        tp.appendChild(el('span', 'q-metric-v', fmtNumTight(m.tp_remains)));
+        grid.appendChild(tp);
+      }
+      if (m.credit_total !== '' && m.credit_total != null) {
+        const cr = el('div', 'q-metric');
+        cr.appendChild(el('span', 'q-metric-k', '积分余额'));
+        cr.appendChild(el('span', 'q-metric-v', String(m.credit_total)));
+        grid.appendChild(cr);
+      }
+      if (grid.childNodes.length) wrap.appendChild(grid);
+      if (m.has_token_plan && (m.credit_free || m.credit_paid)) {
+        wrap.appendChild(el('div', 'q-sub', `其中免费 ${m.credit_free || 0} · 购买 ${m.credit_paid || 0}`));
+      }
+    } else if (plan.membership_error) {
+      wrap.appendChild(el('div', 'q-err', '套餐/积分读取失败：' + plan.membership_error));
+    }
+
+    // 5 小时 / 周窗口：频控百分比，不是余额。只有真的有 token plan 才有窗口。
+    const w = plan.window;
+    if (m && m.has_token_plan && w) {
+      wrap.appendChild(windowRow('5 小时窗口', w.interval_used_percent, w.interval_end_ms));
+      wrap.appendChild(windowRow('周窗口', w.weekly_used_percent, w.weekly_end_ms));
+    } else if (m && m.has_token_plan && plan.window_error) {
+      wrap.appendChild(el('div', 'q-sub', '窗口用量不可用：' + plan.window_error));
+    }
+
+    // 图片免费次数：老的次数池，活动期才有意义。
+    if (q.error) {
+      wrap.appendChild(el('div', 'q-err', '图片额度读取失败：' + q.error));
+    } else if (q.total != null) {
+      const total = Number(q.total) || 0;
+      const used = Number(q.used) || 0;
+      const row = el('div', 'quota-row');
+      row.appendChild(el('span', 'q-k', '图片免费次数'));
+      row.appendChild(bar(total > 0 ? (used / total) * 100 : 0));
+      row.appendChild(el('span', 'q-v mono', `已用 ${used} / ${total}　剩余 ${Number(q.remaining) || 0}`));
+      wrap.appendChild(row);
+    }
+    return wrap;
+  }
+
   function renderQuota(d) {
     const card = $('#quota-card');
     const box = $('#quota-list');
@@ -255,29 +365,16 @@
     card.hidden = false;
     box.textContent = '';
     for (const q of list) {
-      const row = el('div', 'quota-row');
-      row.appendChild(el('div', 'q-name', q.label || q.id));
-      if (q.error) {
-        row.appendChild(el('div', 'q-err', '读取失败：' + q.error));
-        box.appendChild(row);
-        continue;
-      }
-      const bar = el('div', 'q-bar');
-      const fill = el('i');
-      const total = Number(q.total) || 0;
-      const used = Number(q.used) || 0;
-      const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
-      fill.style.width = pct + '%';
-      bar.appendChild(fill);
-      row.appendChild(bar);
-      row.appendChild(el('div', 'q-num', `已用 ${used} / ${total}　剩余 ${Number(q.remaining) || 0}`));
-      box.appendChild(row);
+      box.appendChild(quotaBlock(q));
     }
     const note = $('#quota-note');
     if (note) {
-      note.textContent = d.any_active
-        ? '限时免费 · 按次数计'
-        : '当前不在免费活动期';
+      const live = list.filter((q) => q.plan && q.plan.membership).length;
+      note.textContent = live
+        ? `${live} 个账号 · 三组池子互不换算`
+        : d.any_active
+          ? '限时免费 · 按次数计'
+          : '当前不在免费活动期';
     }
   }
 

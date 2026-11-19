@@ -28,10 +28,9 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/videotask"
 )
 
-// Version 网关版本。默认值是本地直接 `go build` / `go run` 时的兜底，
-// 正式发布由 CI 用 -ldflags "-X .../internal/server.Version=<tag>" 覆盖。
-// 必须是 var 而非 const —— const 无法被 ldflags 改写。
-var Version = "0.6.1"
+// Version 网关版本。发布流水线会把它写回成与 tag 一致的值（见 release.yml 的 bump 步骤），
+// 所以这里必须保持 `const Version = "x.y.z"` 的单一写法，别改成 var 或加构建期注入。
+const Version = "0.6.1"
 
 // Server 网关主对象。
 type Server struct {
@@ -60,6 +59,9 @@ type Server struct {
 	Quota      *quota.Client
 	quotaMu    sync.Mutex
 	quotaCache map[string]quotaEntry
+	// 套餐 / 积分 / 窗口：另一组池子，独立缓存（见 quota.go 的 PlanForAccount）。
+	planMu    sync.Mutex
+	planCache map[string]planEntry
 
 	// fetchAllowPrivate 关掉对外出站下载的 SSRF 内网拦截。
 	// 只给测试用（httptest 起在 127.0.0.1），生产永远为零值。
@@ -89,6 +91,7 @@ func New(
 		usageDirty: make(chan struct{}, 1),
 		Quota:      quota.New(nil),
 		quotaCache: map[string]quotaEntry{},
+		planCache:  map[string]planEntry{},
 	}
 	// 视频任务快照落盘；打不开就退化成内存库（视频不是关键路径，不该阻塞启动）。
 	videoPath := filepath.Join(cfg.Load().DataDir, "videotasks.json")

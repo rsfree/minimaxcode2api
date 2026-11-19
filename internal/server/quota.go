@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/quota"
@@ -76,4 +77,99 @@ func (s *Server) fetchQuota(ctx context.Context, acct store.Account) (*quota.Ima
 	qctx, cancel := context.WithTimeout(ctx, quotaTimeout)
 	defer cancel()
 	return s.Quota.ImageFree(qctx, origin, fresh.AccessToken)
+}
+
+// ---------- 套餐 / 积分 / 窗口 ----------
+
+const (
+	// 套餐与积分变化很慢（只随扣费或签到变动），缓存可以比图片额度更长；
+	// 但也不能太长 —— 用户点面板就是为了确认"刚才那次调用扣了多少"。
+	planTTLSuccess = 60 * time.Second
+	planTTLFailure = 30 * time.Second
+	// 两个端点各自最多等 6 秒，且**并发**取：串行会让首屏等 12 秒。
+	planTimeout = 6 * time.Second
+)
+
+type planEntry struct {
+	at   time.Time
+	data *quota.Plan
+}
+
+func (s *Server) planCached(id string) (*quota.Plan, bool) {
+	s.planMu.Lock()
+	defer s.planMu.Unlock()
+	e, ok := s.planCache[id]
+	if !ok {
+		return nil, false
+	}
+	ttl := planTTLSuccess
+	if e.data == nil || (e.data.Membership == nil && e.data.Window == nil) {
+		ttl = planTTLFailure
+	}
+	if time.Since(e.at) >= ttl {
+		return nil, false
+	}
+	return e.data, true
+}
+
+func (s *Server) planStore(id string, data *quota.Plan) {
+	s.planMu.Lock()
+	defer s.planMu.Unlock()
+	if s.planCache == nil {
+		s.planCache = map[string]planEntry{}
+	}
+	s.planCache[id] = planEntry{at: time.Now(), data: data}
+}
+
+// PlanForAccount 取某账号的「套餐 / 积分 / 窗口」快照。
+//
+// 两个上游端点并发取，任何一个失败只标记它自己那一段 —— 面板绝不能因为
+// 窗口接口抖动就连积分都不显示。只有「拿不到 token」才整体返回 error。
+//
+// 与 ImageQuotaForAccount 一样走 ensureFresh：共用账号级锁，避免面板刷新
+// 与主链路竞态把 refresh_token 刷成 invalid_grant。
+func (s *Server) PlanForAccount(ctx context.Context, acct store.Account) (*quota.Plan, error) {
+	if s.Quota == nil {
+		return nil, errors.New("额度客户端未初始化")
+	}
+	if data, ok := s.planCached(acct.ID); ok {
+		return data, nil
+	}
+	fresh, err := s.ensureFresh(ctx, acct, false)
+	if err != nil {
+		return nil, err
+	}
+	origin := quota.Origin(s.Cfg.Load().Upstream.BaseURL)
+	planOrigin := quota.PlanOrigin(origin)
+	token := fresh.AccessToken
+
+	out := &quota.Plan{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mctx, cancel := context.WithTimeout(ctx, planTimeout)
+		defer cancel()
+		m, err := s.Quota.Membership(mctx, origin, token)
+		if err != nil {
+			out.MembershipError = err.Error()
+			return
+		}
+		out.Membership = m
+	}()
+	go func() {
+		defer wg.Done()
+		wctx, cancel := context.WithTimeout(ctx, planTimeout)
+		defer cancel()
+		w, err := s.Quota.WindowUsage(wctx, planOrigin, token)
+		if err != nil {
+			out.WindowError = err.Error()
+			return
+		}
+		out.Window = w
+	}()
+	wg.Wait()
+
+	s.planStore(acct.ID, out)
+	return out, nil
 }
