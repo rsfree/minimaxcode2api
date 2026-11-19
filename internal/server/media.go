@@ -76,7 +76,15 @@ func (s *Server) callMedia(ctx context.Context, tool string, payload any) ([]byt
 		if errors.As(cerr, &me) {
 			// 计费 / 参数 / "稍后再查"：换号无用，重试还可能打乱已计费任务。
 			// 但 raw 要带回去 —— 视频轮询的 503 里带着 status，客户端据它继续轮询。
-			if me.IsBilling() || me.IsRequest() || me.IsPoll() {
+			if me.IsBilling() {
+				// 额度不足是**账号级**状态：必须把该账号打进冷却，否则下一个请求
+				// 立刻又会 Pick 到它，继续 402，直到人工发现。
+				// 仍然立即返回而不换号重试 —— 同一 plan 的额度换号也是同一个池子，
+				// 重试只会多打一次上游。
+				s.Pool.Failure(acct.ID, http.StatusPaymentRequired)
+				return raw, cerr
+			}
+			if me.IsRequest() || me.IsPoll() {
 				return raw, cerr
 			}
 			if me.IsAuth() {

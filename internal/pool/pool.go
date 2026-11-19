@@ -28,7 +28,10 @@ type state struct {
 	failures      int
 	// cooldownStage 429 指数退避的阶梯计数，成功一次清零。
 	cooldownStage int
-	lastPick      time.Time
+	// billingStage 402 的阶梯计数。必须与 429 分开：一次频控 + 一次额度不足
+	// 若共用阶梯，第二次就会直接跳到 2 倍，把恢复窗口估得过高。
+	billingStage int
+	lastPick     time.Time
 }
 
 // Pool 账号池。
@@ -88,6 +91,7 @@ func (p *Pool) Success(id string) {
 	if s, ok := p.state[id]; ok {
 		s.failures = 0
 		s.cooldownStage = 0
+		s.billingStage = 0
 		s.cooldownUntil = time.Time{}
 	}
 }
@@ -117,16 +121,14 @@ func (p *Pool) Failure(id string, status int) {
 	switch {
 	case status == 429:
 		s.cooldownStage++
-		base := cfg.Cooldown429.Std()
-		d := base
-		for i := 1; i < s.cooldownStage; i++ {
-			d *= 2
-			if d >= cfg.Cooldown429Max.Std() {
-				d = cfg.Cooldown429Max.Std()
-				break
-			}
-		}
-		p.extendLocked(s, d)
+		p.extendLocked(s, backoff(cfg.Cooldown429.Std(), cfg.Cooldown429Max.Std(), s.cooldownStage))
+
+	case status == 402:
+		// 额度不足（套餐窗口打满 / 积分耗尽）。这是**账号级、有时间跨度**的状态，
+		// 不能按 5xx 的 30 秒处理：那样打满的账号每 30 秒就会被重新选中一次，
+		// 每个请求都拿 402，直到人工发现。
+		s.billingStage++
+		p.extendLocked(s, backoff(cfg.CooldownBilling.Std(), cfg.CooldownBillingMax.Std(), s.billingStage))
 
 	case status == 401 || status == 403:
 		// token 失效：短冷却，等刷新或人工处理。
@@ -142,6 +144,25 @@ func (p *Pool) Failure(id string, status int) {
 			s.failures = 0
 		}
 	}
+}
+
+// backoff 返回第 stage 次连续失败应冷却的时长：base × 2^(stage-1)，上限 max。
+// stage ≤ 1 时即 base。
+func backoff(base, max time.Duration, stage int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	d := base
+	for i := 1; i < stage; i++ {
+		if d >= max {
+			return max
+		}
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 func (p *Pool) extendLocked(s *state, d time.Duration) {

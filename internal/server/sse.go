@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
@@ -174,7 +175,13 @@ func (s *Server) doUpstream(ctx context.Context, body []byte, stream bool) (*ups
 				s.noteAccountError(acct.ID, apiErr)
 				continue // 强制刷新后同账号再试
 			}
-			s.Pool.Failure(acct.ID, apiErr.Status)
+			// 额度不足统一按 402 记账：pool 据此走「额度冷却」，而不是
+			// 落进 default 分支等三次失败才熔断。对外状态码不变，仍用上游原文。
+			failStatus := apiErr.Status
+			if apiErr.BillingError() && failStatus != http.StatusPaymentRequired {
+				failStatus = http.StatusPaymentRequired
+			}
+			s.Pool.Failure(acct.ID, failStatus)
 			s.noteAccountError(acct.ID, apiErr)
 			resp = nil
 			break

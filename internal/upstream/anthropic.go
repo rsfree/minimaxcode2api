@@ -122,6 +122,30 @@ func (e *APIError) AuthError() bool {
 	return e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden
 }
 
+// BillingError 额度 / 计费层面的拒绝。
+//
+// 除了明确的 HTTP 402，上游还有两种表达同一件事的写法，都需要识别：
+//   - 400 + error.type = insufficient_quota（OpenAI 兼容层常见）
+//   - 200/400 + 文案 "plan balance has run out"
+//
+// 识别它只为一件事：让账号进「额度冷却」。换号重试依然无意义（同一 plan 的
+// 额度是账号维度的），所以不并入 Retryable。
+func (e *APIError) BillingError() bool {
+	if e.Status == http.StatusPaymentRequired {
+		return true
+	}
+	switch strings.ToLower(e.Detail.Type) {
+	case "insufficient_quota", "billing_error", "insufficient_balance":
+		return true
+	}
+	low := strings.ToLower(firstNonEmpty(e.Detail.Message, e.Message, e.raw))
+	// 只认上游的固定措辞，不用 "balance" / "quota" 这类宽泛词，避免把
+	// 客户端写错参数时的报错也当成额度问题、把好账号冷却掉。
+	return strings.Contains(low, "plan balance has run out") ||
+		strings.Contains(low, "insufficient quota") ||
+		strings.Contains(low, "insufficient balance")
+}
+
 // ParseError 读取并解析错误响应。
 func ParseError(status int, body io.Reader) *APIError {
 	raw, _ := io.ReadAll(io.LimitReader(body, 64<<10))

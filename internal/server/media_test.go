@@ -233,3 +233,41 @@ func TestBillingHintMatchesUpstream(t *testing.T) {
 		t.Fatalf("未知措辞不该被加提示: %s", billingHint(other))
 	}
 }
+
+// 402 之后必须把该账号打入冷却：同一个客户端再请求，应该换到另一个账号，
+// 而不是继续撞同一面墙（这正是「额度临时不足」时最容易踩的坑）。
+func TestImagesBillingCoolsAccount(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			io.WriteString(w, `{"code":402,"message":"plan balance has run out"}`)
+			return
+		}
+		io.WriteString(w, `{"code":0,"success_items":[{"output_file":"slot_0.png",
+			"output_url":"https://cdn.hailuoai.com/x.png","has_image_output":true}]}`)
+	}, "tok1", "tok2")
+
+	resp1, raw1 := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	if resp1.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("首个请求状态码 = %d，期望 402，body=%s", resp1.StatusCode, raw1)
+	}
+
+	resp2, raw2 := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("第二个请求状态码 = %d，期望 200（应换号成功），body=%s", resp2.StatusCode, raw2)
+	}
+
+	hits := f.upHits()
+	if len(hits) < 2 {
+		t.Fatalf("上游只收到 %d 次调用: %v", len(hits), hits)
+	}
+	if hits[0] == hits[1] {
+		t.Fatalf("额度不足后仍打到同一账号(%s)：冷却没生效", hits[0])
+	}
+}

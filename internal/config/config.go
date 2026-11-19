@@ -86,9 +86,14 @@ type Pool struct {
 	Cooldown429     Duration `json:"cooldown_429"`
 	Cooldown429Max  Duration `json:"cooldown_429_max"`
 	Cooldown5xx     Duration `json:"cooldown_5xx"`
-	BreakerFailures int      `json:"breaker_failures"`
-	BreakerCooldown Duration `json:"breaker_cooldown"`
-	RefreshBefore   Duration `json:"refresh_before"`
+	// CooldownBilling 是「额度不足（402）」的冷却。与 429 分开配置，因为
+	// 两者的恢复时间量级完全不同：429 是秒级频控，402 是 5 小时/周窗口或
+	// 积分耗尽，动辄几十分钟。混用会让打满的账号每 30 秒被重新命中一次。
+	CooldownBilling    Duration `json:"cooldown_billing"`
+	CooldownBillingMax Duration `json:"cooldown_billing_max"`
+	BreakerFailures    int      `json:"breaker_failures"`
+	BreakerCooldown    Duration `json:"breaker_cooldown"`
+	RefreshBefore      Duration `json:"refresh_before"`
 }
 
 // Defaults 对外接口的缺省值。
@@ -193,9 +198,13 @@ func Default() *Config {
 			Cooldown429:     Duration(60 * time.Second),
 			Cooldown429Max:  Duration(30 * time.Minute),
 			Cooldown5xx:     Duration(30 * time.Second),
-			BreakerFailures: 3,
-			BreakerCooldown: Duration(5 * time.Minute),
-			RefreshBefore:   Duration(10 * time.Minute),
+			// 402 起手 5 分钟：足够跨过一次瞬时抖动，又不至于额度已恢复却还压着账号；
+			// 连续 402 指数退避到 30 分钟，对应周窗口打满的常见时长。
+			CooldownBilling:    Duration(5 * time.Minute),
+			CooldownBillingMax: Duration(30 * time.Minute),
+			BreakerFailures:    3,
+			BreakerCooldown:    Duration(5 * time.Minute),
+			RefreshBefore:      Duration(10 * time.Minute),
 		},
 		Defaults: Defaults{
 			Model:           "MiniMax-M3.1-Flash",
@@ -403,6 +412,12 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Pool.Cooldown5xx <= 0 {
 		c.Pool.Cooldown5xx = d.Pool.Cooldown5xx
+	}
+	if c.Pool.CooldownBilling <= 0 {
+		c.Pool.CooldownBilling = d.Pool.CooldownBilling
+	}
+	if c.Pool.CooldownBillingMax <= 0 {
+		c.Pool.CooldownBillingMax = d.Pool.CooldownBillingMax
 	}
 	if c.Pool.BreakerFailures <= 0 {
 		c.Pool.BreakerFailures = d.Pool.BreakerFailures
