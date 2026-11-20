@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -203,13 +204,22 @@ func (s *Server) runImageGeneration(
 // 实测 6 路并发约 1/6、10 路并发约 1/8 会抽到，串行请求几乎不出现；同一条
 // payload 原样重打即可成功（实测同一 prompt 首打 502、二打 200）。
 // 所以宁可多打两次，也不要把可恢复的抖动当 502 透给客户端。
-const maxImageSoftRetries = 2
+const maxImageSoftRetries = 3
 
 // imageBusyPoll 是池满时重新取号的间隔。
 const imageBusyPoll = 300 * time.Millisecond
 
-// imageSoftRetryDelay 是软失败补打前的等待。变量而非常量：单测里调小。
-var imageSoftRetryDelay = 1200 * time.Millisecond
+// imageSoftRetryDelay 是软失败补打前的基准等待。变量而非常量：单测里调小。
+//
+// 必须带抖动：并发请求在同一时刻吃到软失败后，如果都等固定的 1.2s，补打会
+// 再次同时打到上游，等于复现一次突发 —— 实测 10 路并发时两条补打日志相隔
+// 10ms 落在同一秒，就是这么来的。
+var imageSoftRetryDelay = 1500 * time.Millisecond
+
+// imageSoftRetryWait 返回带抖动的补打等待（0.7~1.6 倍）。
+func imageSoftRetryWait() time.Duration {
+	return time.Duration(float64(imageSoftRetryDelay) * (0.7 + 0.9*rand.Float64()))
+}
 
 // statusClientClosed 是「客户端已断开」的记账码（nginx 惯例 499），只进日志。
 const statusClientClosed = 499
@@ -271,7 +281,7 @@ func (s *Server) synthesizeImage(
 		if !isContentRejection(msg) && softFails < maxImageSoftRetries && isTransientSlotFailure(msg) {
 			softFails++
 			log.Printf("图片槽位软失败，补打 %d/%d：%s", softFails, maxImageSoftRetries, msg)
-			if !sleepCtx(ctx, imageSoftRetryDelay) {
+			if !sleepCtx(ctx, imageSoftRetryWait()) {
 				s.logMedia(r, req.Model, statusClientClosed, start, ctx.Err())
 				return nil, &imageproto.ProtocolError{
 					Status: statusClientClosed, Type: "api_error",
