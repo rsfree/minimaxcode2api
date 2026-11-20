@@ -306,8 +306,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 |---|---|---|
 | `POST /v1/images/generations` | OpenAI 图像协议（canonical），见下节 | ✅ 真调 + schema 全验 |
 | 视频四个端点 | 异步视频协议（canonical），见下节 | ✅ 提交/查询/列表/删除全验 |
-| `POST /v1/audio/speech` | 文本转语音，直接回音频字节 | ✅ 真调通过 |
-| `POST /v1/audio/transcriptions` | 语音转文字，支持 multipart 与 JSON(base64/url) | ✅ TTS→ASR 闭环一致 |
+| `POST /v1/audio/speech` | 文本转语音，OpenAI 音色名 / response_format / speed 已适配 | ✅ 真调 + OpenAI SDK 通过 |
+| `POST /v1/audio/transcriptions` | 语音转文字，multipart / JSON，json / text / verbose_json | ✅ 真调 + OpenAI SDK 通过 |
 | `POST /v1/audio/music` | 音乐生成，默认回字节，`response_format=url` 回链接 | ✅ 真调通过 |
 | `GET /v1/voices` | 音色列表（实测 327 个） | ✅ 真调通过 |
 | `POST /v1/images/remove-background` | 抠图 → 透明 PNG（回顶层 `output_url`） | ✅ 真调通过 |
@@ -650,6 +650,79 @@ token 用量，所以通常没有这一项，这是**已知缺口**而不是省�
 - 参考视频要额外给 `reference_video_duration_seconds`（上游拿它校验，网关无法可靠探测远程时长）；
 - 参考图 / 参考视频 / 参考音频只支持 `MiniMax-H3`。
 
+## 语音接口（OpenAI 音频协议）
+
+两个 OpenAI 音频端点 + 一个音色列表 + 一个音乐扩展：
+
+```bash
+# 文本转语音（响应体就是音频字节）
+curl $BASE/v1/audio/speech -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","voice":"nova","input":"你好","response_format":"mp3"}' -o out.mp3
+
+# 语音转文字（OpenAI 原生 multipart）
+curl $BASE/v1/audio/transcriptions -H "Authorization: Bearer $KEY" \
+  -F file=@out.mp3 -F model=whisper-1 -F response_format=text
+
+# 音色列表（上游 327 个，非 OpenAI 协议）
+curl $BASE/v1/voices -H "Authorization: Bearer $KEY"
+```
+
+### 与 OpenAI 的差异（都是上游能力决定的）
+
+上游 TTS 工具 `synthesize_speech` 的 schema 只有 `text / voice_id / speed / volume /
+pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
+`audio_info{url|data, mime_type, prompt}`，**没有语言与时间戳**。
+所以下面这些字段只能映射、降级或明确拒绝，不做假装支持：
+
+| 字段 | 处理 |
+|---|---|
+| `voice` | OpenAI 的 11 个音色名按性别/语调映射到上游预置音色（见下表）；其余值原样透传，可直传 327 个 `voice_id` |
+| `response_format`（speech） | 只认 OpenAI 六种取值；上游只能出 **mp3**，`wav/pcm/opus/aac/flac` 按 mp3 返回，并在响应头标注 |
+| `speed` | OpenAI `0.25–4.0`，上游 `0.5–2.0`；落在外圈时收敛，收敛值放响应头 |
+| `stream_format` | 只接受 `audio`；`sse` 明确 400（网关不产生 SSE 音频事件） |
+| `instructions` | 接受但忽略（上游无等价参数） |
+| `language`（ASR） | 接受但不下发；`verbose_json` 里回显的是**请求提示值**，不是检测结果 |
+| `response_format`（ASR） | `json` / `text` / `verbose_json` 实现；`srt` / `vtt` 在网关侧 400（上游无时间戳，硬编会产出全错的时间轴） |
+| `file` 大小 | 25MB 上限（对齐 OpenAI），超限 413 |
+
+**音色映射**（近似映射：对齐性别与语调，不承诺听感与 OpenAI 一致）：
+
+| OpenAI | MiniMax | OpenAI | MiniMax |
+|---|---|---|---|
+| alloy | male-qn-qingse | nova | female-shaonv |
+| echo | male-qn-jingying | shimmer | female-tianmei |
+| fable | male-qn-jingying-jingpin | sage | female-yujie |
+| onyx | male-qn-badao | coral | female-chengshu |
+| ash | male-qn-daxuesheng | ballad | male-qn-badao-jingpin |
+| verse | male-qn-qingse-jingpin | | |
+
+### 降级与诊断头
+
+`synthesize_speech` 只会出 mp3，这是上游硬限制（不是网关偷懒）。请求
+`response_format=wav` 仍会成功，但响应头会把事实写清楚，避免调用方以为拿到了 wav：
+
+| 响应头 | 含义 |
+|---|---|
+| `X-MiniMax-Format` | 实际返回的格式（目前恒为 `mp3`） |
+| `X-MiniMax-Format-Requested` | 仅在实际格式 ≠ 请求格式时出现 |
+| `X-MiniMax-Voice` / `X-MiniMax-Voice-Alias` | 实际下发的 `voice_id` / 命中的 OpenAI 别名 |
+| `X-MiniMax-Speed` | 仅当 speed 被收敛时出现，值为实际下发值 |
+
+`verbose_json` 的 `segments` 恒为空数组，并带一条 `warnings` 说明上游不返回时间戳。
+
+### 实测记录（2026-11-21）
+
+用官方 `openai` Python SDK（2.x）直连网关，不是 curl 自证：
+
+| 调用 | 结果 |
+|---|---|
+| `audio.speech.create(model="tts-1", voice="nova")` | 200，`audio/mpeg`，`X-MiniMax-Voice: female-shaonv` |
+| `audio.transcriptions.create(..., response_format="text")` | 返回 `str`（纯文本，不是 JSON 字符串） |
+| `audio.transcriptions.create(...)`（默认 json） | 返回 `Transcription` 对象，`.text` 可直接读 |
+| `audio.transcriptions.create(..., response_format="verbose_json")` | 返回 `TranscriptionVerbose`，`segments=[]`、`task=transcribe` |
+| `response_format="srt"` | 400 `unsupported_response_format`，**不打上游** |
+
 ## 扩展能力（同步视频 / 图像工具 / 理解类）
 
 这一组路由对应上游 `GET /mavis/api/v1/mcp/tools` 里**本网关此前没有暴露**的工具。
@@ -774,6 +847,11 @@ curl $BASE/v1/images/describe -H "Authorization: Bearer $KEY" \
 ## 边界（明确不做）
 
 - 不做 `/v1/responses`、embeddings、rerank；
+- 不做 `/v1/audio/translations`：上游没有音频翻译工具，"先转写再调对话模型翻译"是
+  另一条计费链路，不属于音频适配范围；
+- 不做语音格式转码：上游 TTS 只出 mp3，`wav/pcm/opus/aac/flac` 目前按 mp3 降级并
+  在响应头标注。内置 ffmpeg 可做到全兼容，但镜像会从 ~20MB 涨到 ~100MB，
+  2026-11-21 与用户确认先不引入；
 - 不做**联网搜索**的独立路由（上游 `web_search` 属 agent 内部工具）；
   图片/视频/音频的**理解**已由 `/v1/images/describe`、`/v1/videos/understand`、
   `/v1/audio/understand` 三条确定路由承担，不再走 chat 端点赌媒体块能不能过；
@@ -801,6 +879,7 @@ internal/upstream/   上游客户端（Anthropic Messages）
 internal/media/      媒体网关客户端（/mavis/api/v1/mcp/*，业务码在 body 里）
                      └ result.go：出参候选键提取（认不出就报错，不猜结构）
 internal/convert/    OpenAI ⇄ Anthropic 协议转换（请求/响应/流式）
+internal/audioproto/ OpenAI 音频协议：音色映射、response_format / speed 收敛（纯函数）
 internal/imageproto/ OpenAI 图像协议：canonical 折叠 + 上游槽位映射（纯函数）
 internal/videoproto/ 异步视频协议：canonical 折叠 + 六态收敛（纯函数）
 internal/videotask/  视频任务快照（落盘，重启可查）
