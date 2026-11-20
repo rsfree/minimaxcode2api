@@ -30,7 +30,7 @@ import (
 
 // Version 网关版本。发布流水线会把它写回成与 tag 一致的值（见 release.yml 的 bump 步骤），
 // 所以这里必须保持 `const Version = "x.y.z"` 的单一写法，别改成 var 或加构建期注入。
-const Version = "0.6.3"
+const Version = "0.6.4"
 
 // Server 网关主对象。
 type Server struct {

@@ -283,6 +283,28 @@ func (p *Pool) Snapshot() map[string]Stats {
 	return out
 }
 
+// AllCooling 报告「没有任何非冷却的可用账号」。
+//
+// 用途是给上层的排队逻辑一个刹车：池满分两种——「有人只是忙」等一会儿槽位
+// 就会释放，值得排队；「全在冷却」是账号级故障（429/402/5xx），排队只是把
+// 客户端拖到超时，应当立刻回 429 让它自己退避。返回 false 也可能是池里
+// 一个账号都没有（那是 ErrNoAccount 的范畴），交给 Pick 区分。
+func (p *Pool) AllCooling() bool {
+	accounts := p.store.List()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for _, a := range accounts {
+		if a.Disabled {
+			continue
+		}
+		if !now.Before(p.st(a.ID).cooldownUntil) {
+			return false
+		}
+	}
+	return len(accounts) > 0
+}
+
 // Reset 清除某账号的冷却（面板"恢复"按钮）。
 func (p *Pool) Reset(id string) {
 	p.mu.Lock()

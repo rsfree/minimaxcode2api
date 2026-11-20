@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -139,41 +140,12 @@ func (s *Server) runImageGeneration(
 	w http.ResponseWriter, r *http.Request,
 	req *imageproto.Request, payload map[string]any, warnings []string, start time.Time,
 ) {
-	raw, err := s.callMedia(r.Context(), media.ToolImageSynthesize, payload)
-	if err != nil {
-		s.logMedia(r, req.Model, http.StatusBadGateway, start, err)
-		perr := imageErrorFromMedia(err)
+	resp, perr := s.synthesizeImage(r.Context(), req, payload, start, r)
+	if perr != nil {
 		if perr.Status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "5")
 		}
 		writeImageError(w, perr)
-		return
-	}
-
-	var resp imageSynthResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		writeImageError(w, &imageproto.ProtocolError{
-			Status: http.StatusBadGateway, Type: "upstream_error",
-			Code: "bad_upstream", Message: "上游响应无法解析: " + err.Error(),
-		})
-		return
-	}
-
-	// 上游把「模型拒答」表现为 success=false + text_response，而不是 HTTP 错误。
-	if len(resp.SuccessItems) == 0 {
-		msg := "图片生成失败"
-		code := "generation_failed"
-		status := http.StatusBadGateway
-		if len(resp.FailedItems) > 0 {
-			msg = firstNonEmptyStr(resp.FailedItems[0].ErrorMsg, msg)
-			if isContentRejection(msg) {
-				code, status = "content_filter", http.StatusBadRequest
-			}
-		}
-		s.logMedia(r, req.Model, status, start, errors.New(msg))
-		writeImageError(w, &imageproto.ProtocolError{
-			Status: status, Type: errorType(status), Code: code, Message: msg,
-		})
 		return
 	}
 
@@ -222,6 +194,125 @@ func (s *Server) runImageGeneration(
 		out["warnings"] = warnings
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// maxImageSoftRetries 是「上游槽位软失败」的补打次数。
+//
+// 上游出图是槽位制：HTTP 200 + success_items 为空 + failed_items 里写
+// "please retry the same request shortly" 属于**常态抖动**，不是终态错误。
+// 实测 6 路并发约 1/6、10 路并发约 1/8 会抽到，串行请求几乎不出现；同一条
+// payload 原样重打即可成功（实测同一 prompt 首打 502、二打 200）。
+// 所以宁可多打两次，也不要把可恢复的抖动当 502 透给客户端。
+const maxImageSoftRetries = 2
+
+// imageBusyPoll 是池满时重新取号的间隔。
+const imageBusyPoll = 300 * time.Millisecond
+
+// imageSoftRetryDelay 是软失败补打前的等待。变量而非常量：单测里调小。
+var imageSoftRetryDelay = 1200 * time.Millisecond
+
+// statusClientClosed 是「客户端已断开」的记账码（nginx 惯例 499），只进日志。
+const statusClientClosed = 499
+
+// synthesizeImage 调上游出图，带两类重试：
+//
+//  1. 池满（ErrAllBusy）：等到 pool.max_wait 为止。图片是长任务（1K 约 20s），
+//     突发并发下立刻回 429 会把本可成功的请求直接丢掉；排队等前一批释放槽位，
+//     10 路突发的成功率从 70% 拉到接近 100%。全部账号都在冷却时不等 —— 那是
+//     账号级故障，排队只会把客户端拖到超时。
+//  2. 上游软失败：换号补打，最多 maxImageSoftRetries 次（见上）。
+//
+// 返回 (resp, nil) 表示拿到了 success_items；否则 perr 是终态错误。
+func (s *Server) synthesizeImage(
+	ctx context.Context, req *imageproto.Request, payload map[string]any,
+	start time.Time, r *http.Request,
+) (*imageSynthResponse, *imageproto.ProtocolError) {
+	// 排队截止时间按「请求开始」算，不按重试次数算：否则池满时每次重试都能
+	// 续命，客户端会被一路拖到 nginx 的 660s 读超时。
+	waitUntil := start.Add(s.Cfg.Load().Pool.MaxWait.Std())
+	softFails := 0
+
+	for {
+		raw, err := s.callMedia(ctx, media.ToolImageSynthesize, payload)
+		if err != nil {
+			if errors.Is(err, pool.ErrAllBusy) && time.Now().Before(waitUntil) && !s.Pool.AllCooling() {
+				if !sleepCtx(ctx, imageBusyPoll) {
+					s.logMedia(r, req.Model, statusClientClosed, start, ctx.Err())
+					return nil, &imageproto.ProtocolError{
+						Status: statusClientClosed, Type: "api_error",
+						Code: "client_closed", Message: "客户端已断开",
+					}
+				}
+				continue
+			}
+			s.logMedia(r, req.Model, http.StatusBadGateway, start, err)
+			return nil, imageErrorFromMedia(err)
+		}
+
+		var resp imageSynthResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			s.logMedia(r, req.Model, http.StatusBadGateway, start, err)
+			return nil, &imageproto.ProtocolError{
+				Status: http.StatusBadGateway, Type: "upstream_error",
+				Code: "bad_upstream", Message: "上游响应无法解析: " + err.Error(),
+			}
+		}
+
+		// 上游把「模型拒答」表现为 success=false + text_response，而不是 HTTP 错误。
+		if len(resp.SuccessItems) > 0 {
+			return &resp, nil
+		}
+
+		msg := "图片生成失败"
+		if len(resp.FailedItems) > 0 {
+			msg = firstNonEmptyStr(resp.FailedItems[0].ErrorMsg, msg)
+		}
+		// 先判审核：拒答的文案里也可能带 retry 字样，重试既不解决问题还会重复计费。
+		if !isContentRejection(msg) && softFails < maxImageSoftRetries && isTransientSlotFailure(msg) {
+			softFails++
+			log.Printf("图片槽位软失败，补打 %d/%d：%s", softFails, maxImageSoftRetries, msg)
+			if !sleepCtx(ctx, imageSoftRetryDelay) {
+				s.logMedia(r, req.Model, statusClientClosed, start, ctx.Err())
+				return nil, &imageproto.ProtocolError{
+					Status: statusClientClosed, Type: "api_error",
+					Code: "client_closed", Message: "客户端已断开",
+				}
+			}
+			continue
+		}
+
+		status := http.StatusBadGateway
+		code := "generation_failed"
+		if isContentRejection(msg) {
+			code, status = "content_filter", http.StatusBadRequest
+		}
+		s.logMedia(r, req.Model, status, start, errors.New(msg))
+		return nil, &imageproto.ProtocolError{
+			Status: status, Type: errorType(status), Code: code, Message: msg,
+		}
+	}
+}
+
+// isTransientSlotFailure 判定上游软失败是否值得原样补打。
+//
+// 只认上游自己给出的重试邀请，不猜：把参数错/审核拒重打一遍既费时又可能
+// 重复计费。上游原文形如
+// "request failed; please retry the same request shortly, or try again later ..."。
+func isTransientSlotFailure(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "please retry") || strings.Contains(m, "try again later")
+}
+
+// sleepCtx 等待 d，期间 ctx 取消则返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // writeImageError 输出四键错误信封（message / type / param / code）。

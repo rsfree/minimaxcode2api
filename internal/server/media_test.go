@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 )
@@ -181,6 +182,11 @@ func TestImagesContentFilterIs400(t *testing.T) {
 	if !strings.Contains(string(raw), "content_filter") {
 		t.Fatalf("应归因成 content_filter: %s", raw)
 	}
+	// 审核拒答里也可能出现 "retry" 字样，绝不能被软失败重试逻辑捞走：
+	// 重打一次既解决不了问题，还可能重复计费。
+	if n := f.upCalls(); n != 1 {
+		t.Fatalf("上游被调用 %d 次，审核拒答应只打 1 次", n)
+	}
 }
 
 // 池的两种容量错误在媒体链路上必须与文本链路同口径：
@@ -269,5 +275,92 @@ func TestImagesBillingCoolsAccount(t *testing.T) {
 	}
 	if hits[0] == hits[1] {
 		t.Fatalf("额度不足后仍打到同一账号(%s)：冷却没生效", hits[0])
+	}
+}
+
+// shrinkImageRetryDelay 把补打间隔压到毫秒级，避免单测真的睡 1.2s。
+func shrinkImageRetryDelay(t *testing.T) {
+	t.Helper()
+	old := imageSoftRetryDelay
+	imageSoftRetryDelay = time.Millisecond
+	t.Cleanup(func() { imageSoftRetryDelay = old })
+}
+
+const softSlotFailBody = `{"code":0,"total_success":0,"total_failed":1,
+	"success_items":[],"failed_items":[{"output_file":"slot_0.png",
+	"error_msg":"image generation failed: request failed; please retry the same request shortly, or try again later if the issue persists"}]}`
+
+// 上游槽位软失败（HTTP 200 + success=false + "please retry"）必须换号补打，
+// 而不是把 502 透给客户端 —— 实测同一条 payload 二打就能出图。
+func TestImagesSoftFailureRetried(t *testing.T) {
+	shrinkImageRetryDelay(t)
+	var mu sync.Mutex
+	calls := 0
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			io.WriteString(w, softSlotFailBody)
+			return
+		}
+		io.WriteString(w, `{"code":0,"total_success":1,
+			"success_items":[{"output_file":"slot_0.png","output_url":"https://cdn.test/a.png","has_image_output":true}]}`)
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（软失败应补打成功），body=%s", resp.StatusCode, raw)
+	}
+	if n := f.upCalls(); n != 2 {
+		t.Fatalf("上游被调用 %d 次，期望 2（1 次软失败 + 1 次补打）", n)
+	}
+	if !strings.Contains(string(raw), "https://cdn.test/a.png") {
+		t.Fatalf("补打成功后应回图片 URL: %s", raw)
+	}
+}
+
+// 补打次数有上限：连续软失败仍然收口成 502，且不能无限重打。
+func TestImagesSoftFailureGivesUp(t *testing.T) {
+	shrinkImageRetryDelay(t)
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, softSlotFailBody)
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d，期望 502，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "generation_failed") {
+		t.Fatalf("错误码应为 generation_failed: %s", raw)
+	}
+	if n := f.upCalls(); n != maxImageSoftRetries+1 {
+		t.Fatalf("上游被调用 %d 次，期望 %d", n, maxImageSoftRetries+1)
+	}
+}
+
+// 池满时排队等槽位，不能立刻 429；但「全在冷却」是账号级故障，必须快速失败，
+// 否则客户端会被白等到 pool.max_wait（默认 60s）。
+func TestImagesAllCoolingFailsFast(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("全冷却时不该打到上游")
+	}, "tok1")
+
+	f.srv.Pool.Failure("acct-0", http.StatusTooManyRequests)
+
+	begin := time.Now()
+	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
+	elapsed := time.Since(begin)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("状态码 = %d，期望 429，body=%s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "all_accounts_busy") {
+		t.Fatalf("错误码应为 all_accounts_busy: %s", raw)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("全冷却时耗时 %v，应立即失败而不是排队", elapsed)
 	}
 }

@@ -191,6 +191,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `upstream.base_url` | 到 `/v1` 为止，代码里再拼 `/messages` |
 | `pool.strategy` | `weighted`（在途少+最久未用优先，top-3 随机）或 `round_robin` |
 | `pool.max_in_flight` / `max_in_flight_per_account` | 总闸门 / 单账号在途上限 |
+| `pool.max_wait` | 池满时的最长排队时间（默认 `60s`）：图片/视频是长任务，突发并发下排队等槽位比立刻 429 成功率高一个量级。全部账号在冷却时不排队，直接 429 |
 | `pool.cooldown_429` / `cooldown_429_max` | 429 指数退避（封顶） |
 | `pool.cooldown_5xx` | 5xx 冷却；401/403 取它的 2 倍 |
 | `pool.cooldown_billing` / `cooldown_billing_max` | 402 额度不足的独立退避（默认 5m → 30m 封顶）。与 429 分开配置：429 是秒级频控，402 是 5h/周窗口或积分耗尽，量级差两个数量级 |

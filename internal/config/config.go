@@ -80,12 +80,17 @@ type OAuth struct {
 
 // Pool 账号池调度参数。
 type Pool struct {
-	Strategy        string   `json:"strategy"` // weighted | round_robin
-	MaxInFlight     int      `json:"max_in_flight"`
-	MaxInFlightAcct int      `json:"max_in_flight_per_account"`
-	Cooldown429     Duration `json:"cooldown_429"`
-	Cooldown429Max  Duration `json:"cooldown_429_max"`
-	Cooldown5xx     Duration `json:"cooldown_5xx"`
+	Strategy        string `json:"strategy"` // weighted | round_robin
+	MaxInFlight     int    `json:"max_in_flight"`
+	MaxInFlightAcct int    `json:"max_in_flight_per_account"`
+	// MaxWait 是「池满（在途上限/冷却）时的最长排队时间」。图片/视频是长任务
+	// （单张 1K 约 20s，4K 约 45s），突发并发下立刻回 429 会把本可成功的请求
+	// 直接丢掉；排队等前一批释放槽位，成功率高一个量级。
+	// 只在「有账号只是忙（非冷却）」时生效；全部冷却时立即失败，不空等。
+	MaxWait        Duration `json:"max_wait"`
+	Cooldown429    Duration `json:"cooldown_429"`
+	Cooldown429Max Duration `json:"cooldown_429_max"`
+	Cooldown5xx    Duration `json:"cooldown_5xx"`
 	// CooldownBilling 是「额度不足（402）」的冷却。与 429 分开配置，因为
 	// 两者的恢复时间量级完全不同：429 是秒级频控，402 是 5 小时/周窗口或
 	// 积分耗尽，动辄几十分钟。混用会让打满的账号每 30 秒被重新命中一次。
@@ -195,9 +200,12 @@ func Default() *Config {
 			Strategy:        "weighted",
 			MaxInFlight:     8,
 			MaxInFlightAcct: 3,
-			Cooldown429:     Duration(60 * time.Second),
-			Cooldown429Max:  Duration(30 * time.Minute),
-			Cooldown5xx:     Duration(30 * time.Second),
+			// 60s ≈ 两轮 8 槽图片生成。给太长会把「上游整体挂了」也拖成长等待，
+			// 给太短则挡不住 10~20 路突发。
+			MaxWait:        Duration(60 * time.Second),
+			Cooldown429:    Duration(60 * time.Second),
+			Cooldown429Max: Duration(30 * time.Minute),
+			Cooldown5xx:    Duration(30 * time.Second),
 			// 402 起手 5 分钟：足够跨过一次瞬时抖动，又不至于额度已恢复却还压着账号；
 			// 连续 402 指数退避到 30 分钟，对应周窗口打满的常见时长。
 			CooldownBilling:    Duration(5 * time.Minute),
@@ -403,6 +411,9 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Pool.MaxInFlightAcct <= 0 {
 		c.Pool.MaxInFlightAcct = d.Pool.MaxInFlightAcct
+	}
+	if c.Pool.MaxWait <= 0 {
+		c.Pool.MaxWait = d.Pool.MaxWait
 	}
 	if c.Pool.Cooldown429 <= 0 {
 		c.Pool.Cooldown429 = d.Pool.Cooldown429
