@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"github.com/linguo2625469/minimaxcode2api/internal/imageproto"
 	"github.com/linguo2625469/minimaxcode2api/internal/media"
 	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
+	"github.com/linguo2625469/minimaxcode2api/internal/negcache"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 )
 
@@ -141,8 +144,26 @@ func (s *Server) runImageGeneration(
 	w http.ResponseWriter, r *http.Request,
 	req *imageproto.Request, payload map[string]any, warnings []string, start time.Time,
 ) {
+	// 负缓存：同一内容刚被审核拒过就直接回同样的 451，不再打上游 ——
+	// 批量重放同一批 prompt 时，这一步省下的是真金白银的槽位与积分。
+	cacheKey := imageNegKey(payload)
+	if e, ok := s.ImgNeg.Get(cacheKey); ok {
+		s.logMedia(r, req.Model, e.Status, start, errors.New(e.Message))
+		w.Header().Set("X-Content-Cache", "hit")
+		writeImageError(w, &imageproto.ProtocolError{
+			Status: e.Status, Type: errorType(e.Status), Code: e.Code, Message: e.Message,
+		})
+		return
+	}
+
 	resp, perr := s.synthesizeImage(r.Context(), req, payload, start, r)
 	if perr != nil {
+		// 只缓存内容层面的终态拒绝；可重试错误进缓存等于自己制造故障。
+		if perr.Status == http.StatusUnavailableForLegalReasons {
+			s.ImgNeg.Put(cacheKey, negcache.Entry{
+				Status: perr.Status, Code: perr.Code, Message: perr.Message,
+			})
+		}
 		if perr.Status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "5")
 		}
@@ -294,13 +315,26 @@ func (s *Server) synthesizeImage(
 		status := http.StatusBadGateway
 		code := "generation_failed"
 		if isContentRejection(msg) {
-			code, status = "content_filter", http.StatusBadRequest
+			// 451 Unavailable For Legal Reasons：内容层拦截的标准信号，
+			// 客户端据此提示用户改内容，而不是去查 key 或重试。
+			code, status = "content_filter", http.StatusUnavailableForLegalReasons
 		}
 		s.logMedia(r, req.Model, status, start, errors.New(msg))
 		return nil, &imageproto.ProtocolError{
 			Status: status, Type: errorType(status), Code: code, Message: msg,
 		}
 	}
+}
+
+// imageNegKey 用「上游请求体」算 key：prompt、比例、档位、参考图都在里面，
+// 任一项不同就是另一条内容。encoding/json 对 map 的 key 排序输出，结果稳定。
+func imageNegKey(payload map[string]any) string {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // isTransientSlotFailure 判定上游软失败是否值得原样补打。
@@ -365,6 +399,12 @@ func imageErrorFromMedia(err error) *imageproto.ProtocolError {
 		}
 	}
 	switch {
+	case me.IsContent():
+		// 上游直接回 451（内容/法务拦截）：原样透出，不要包成 502。
+		return &imageproto.ProtocolError{
+			Status: http.StatusUnavailableForLegalReasons, Type: "invalid_request_error",
+			Code: "content_filter", Message: me.Message,
+		}
 	case me.IsBilling():
 		return &imageproto.ProtocolError{
 			Status: http.StatusPaymentRequired, Type: "api_error",

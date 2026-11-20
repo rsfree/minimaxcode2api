@@ -119,7 +119,7 @@ func (s *Server) runImageFileTool(w http.ResponseWriter, r *http.Request, tool, 
 		}
 		status, code := http.StatusBadGateway, typ+"_failed"
 		if isContentRejection(msg) {
-			status, code = http.StatusBadRequest, "content_filter"
+			status, code = http.StatusUnavailableForLegalReasons, "content_filter"
 		}
 		s.logMedia(r, "", status, start, errors.New(msg))
 		writeImageError(w, &imageproto.ProtocolError{

@@ -167,8 +167,8 @@ func TestImagesAllFailedIs502(t *testing.T) {
 	}
 }
 
-// 审核拒答要归因成 400 content_filter —— 重试无用，客户端应改内容。
-func TestImagesContentFilterIs400(t *testing.T) {
+// 审核拒答要归因成 451 content_filter —— 重试无用，客户端应改内容。
+func TestImagesContentFilterIs451(t *testing.T) {
 	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"code":0,"total_success":0,"total_failed":1,
@@ -176,8 +176,8 @@ func TestImagesContentFilterIs400(t *testing.T) {
 	}, "tok1")
 
 	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"x"}`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("状态码 = %d，期望 451，body=%s", resp.StatusCode, raw)
 	}
 	if !strings.Contains(string(raw), "content_filter") {
 		t.Fatalf("应归因成 content_filter: %s", raw)
@@ -186,6 +186,78 @@ func TestImagesContentFilterIs400(t *testing.T) {
 	// 重打一次既解决不了问题，还可能重复计费。
 	if n := f.upCalls(); n != 1 {
 		t.Fatalf("上游被调用 %d 次，审核拒答应只打 1 次", n)
+	}
+	// 账号不能被这条拒答打冷：冷却了后续正常请求也会被挡。
+	if st, ok := f.srv.Pool.Snapshot()["acct-0"]; ok {
+		if st.Failures != 0 {
+			t.Fatalf("审核拒答不该计入账号失败，failures=%d", st.Failures)
+		}
+		if !st.Available {
+			t.Fatal("审核拒答不该让账号进入冷却")
+		}
+	}
+}
+
+const contentRejectBody = `{"code":0,"total_success":0,"total_failed":1,
+	"success_items":[],"failed_items":[{"output_file":"slot_0.png","error_msg":"prompt 违规，涉及敏感内容"}]}`
+
+// 同一内容被拒后要进负缓存：第二次不再打上游，直接回同一条 451。
+func TestImagesContentFilterNegativeCache(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, contentRejectBody)
+	}, "tok1")
+
+	body := `{"prompt":"违规内容","size":"1K"}`
+	resp1, raw1 := f.post(t, "/v1/images/generations", body)
+	if resp1.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("首次状态码 = %d，期望 451，body=%s", resp1.StatusCode, raw1)
+	}
+	if n := f.upCalls(); n != 1 {
+		t.Fatalf("首次应只打 1 次上游，实际 %d", n)
+	}
+
+	resp2, raw2 := f.post(t, "/v1/images/generations", body)
+	if resp2.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("命中缓存状态码 = %d，期望 451，body=%s", resp2.StatusCode, raw2)
+	}
+	if got := resp2.Header.Get("X-Content-Cache"); got != "hit" {
+		t.Fatalf("缓存命中应带 X-Content-Cache: hit，实际 %q", got)
+	}
+	if n := f.upCalls(); n != 1 {
+		t.Fatalf("缓存命中后不该再打上游，实际共 %d 次", n)
+	}
+	if !strings.Contains(string(raw2), "content_filter") {
+		t.Fatalf("回放的错误码应保持 content_filter: %s", raw2)
+	}
+
+	// 换一个 prompt 就是另一条内容，必须重新问上游（否则缓存会误杀）。
+	resp3, _ := f.post(t, "/v1/images/generations", `{"prompt":"另一段内容","size":"1K"}`)
+	if resp3.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("新内容状态码 = %d，期望 451", resp3.StatusCode)
+	}
+	if n := f.upCalls(); n != 2 {
+		t.Fatalf("不同 prompt 应重新打上游，实际共 %d 次", n)
+	}
+}
+
+// 上游直接回 451（业务码）时同样要透出 451、不换号、不记账、进负缓存。
+func TestImagesUpstream451(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnavailableForLegalReasons)
+		io.WriteString(w, `{"code":451,"message":"content blocked by policy"}`)
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/images/generations", `{"prompt":"blocked"}`)
+	if resp.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("状态码 = %d，期望 451，body=%s", resp.StatusCode, raw)
+	}
+	if n := f.upCalls(); n != 1 {
+		t.Fatalf("451 不该换号重试，上游被调用 %d 次", n)
+	}
+	if st, ok := f.srv.Pool.Snapshot()["acct-0"]; ok && st.Failures != 0 {
+		t.Fatalf("451 不该计入账号失败，failures=%d", st.Failures)
 	}
 }
 

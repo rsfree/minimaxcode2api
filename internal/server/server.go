@@ -18,6 +18,7 @@ import (
 
 	"github.com/linguo2625469/minimaxcode2api/internal/config"
 	"github.com/linguo2625469/minimaxcode2api/internal/modelcat"
+	"github.com/linguo2625469/minimaxcode2api/internal/negcache"
 	"github.com/linguo2625469/minimaxcode2api/internal/oauth"
 	"github.com/linguo2625469/minimaxcode2api/internal/pool"
 	"github.com/linguo2625469/minimaxcode2api/internal/quota"
@@ -30,7 +31,7 @@ import (
 
 // Version 网关版本。发布流水线会把它写回成与 tag 一致的值（见 release.yml 的 bump 步骤），
 // 所以这里必须保持 `const Version = "x.y.z"` 的单一写法，别改成 var 或加构建期注入。
-const Version = "0.6.5"
+const Version = "0.6.6"
 
 // Server 网关主对象。
 type Server struct {
@@ -55,6 +56,10 @@ type Server struct {
 	// 自动签到的"这一次跑过了"标记（分钟级去重，见 signin_sched.go）。
 	signinMu     sync.Mutex
 	signinRunKey string
+	// ImgNeg 图片审核拒绝的负缓存：同一内容在 cache.negative_ttl 内直接回 451，
+	// 不再打上游（省槽位与积分）。
+	ImgNeg *negcache.Cache
+
 	// Quota 读账号的图片免费额度（/minimax-cloud 前缀，与 /mavis 不同根路径）。
 	Quota      *quota.Client
 	quotaMu    sync.Mutex
@@ -90,6 +95,10 @@ func New(
 		Mux:        http.NewServeMux(),
 		usageDirty: make(chan struct{}, 1),
 		Quota:      quota.New(nil),
+		ImgNeg: negcache.New(func() (time.Duration, int) {
+			c := cfg.Load().Cache
+			return c.NegativeTTL.Std(), c.NegativeMax
+		}),
 		quotaCache: map[string]quotaEntry{},
 		planCache:  map[string]planEntry{},
 	}
@@ -547,6 +556,9 @@ func upstreamStatus(err error) (int, string) {
 			return http.StatusBadGateway, "upstream_auth"
 		case apiErr.Status == http.StatusTooManyRequests:
 			return http.StatusTooManyRequests, "upstream_rate_limited"
+		case apiErr.Status == http.StatusUnavailableForLegalReasons:
+			// 内容/法务拦截：给客户端一个明确信号（改内容，不是改 key）。
+			return http.StatusUnavailableForLegalReasons, "content_filter"
 		case apiErr.Status >= 400 && apiErr.Status < 500:
 			// 上游认为请求非法，原样透出状态更利于客户端修正。
 			return apiErr.Status, "upstream_bad_request"

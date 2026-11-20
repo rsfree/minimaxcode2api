@@ -191,6 +191,7 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 | `upstream.base_url` | 到 `/v1` 为止，代码里再拼 `/messages` |
 | `pool.strategy` | `weighted`（在途少+最久未用优先，top-3 随机）或 `round_robin` |
 | `pool.max_in_flight` / `max_in_flight_per_account` | 总闸门 / 单账号在途上限 |
+| `cache.negative_ttl` / `negative_max` | 审核负缓存时长（默认 `10m`，`0` = 关闭）/ 条数上限（默认 1000，LRU 淘汰） |
 | `pool.max_wait` | 池满时的最长排队时间（默认 `60s`）：图片/视频是长任务，突发并发下排队等槽位比立刻 429 成功率高一个量级。全部账号在冷却时不排队，直接 429 |
 | `pool.cooldown_429` / `cooldown_429_max` | 429 指数退避（封顶） |
 | `pool.cooldown_5xx` | 5xx 冷却；401/403 取它的 2 倍 |
@@ -514,8 +515,18 @@ need to top up"，但控制台实际显示的是：
 ### 错误归因
 
 四键信封 `{message, type, param, code}`，按「谁的错」翻：参数错 400；审核拒答
-`400 content_filter`（重试无用）；上游账号失效 `502 upstream_auth`；
-限额触顶 `402 insufficient_quota`（等窗口重置）；网络/5xx `502 upstream_error`。
+`451 content_filter`（内容层拦截，重试无用，客户端应改内容）；上游账号失效
+`502 upstream_auth`；限额触顶 `402 insufficient_quota`（等窗口重置）；
+网络/5xx `502 upstream_error`。
+
+**451 不进账号失败计数**：审核是内容层面的拒绝，与账号健康无关。计入的话，
+一条敏感 prompt 连续三次就能把账号熔断五分钟（表现像"负缓存"），把正常请求
+一起挡在门外。
+
+**审核拒答负缓存**（`cache.negative_ttl`，默认 10 分钟）：命中审核的请求体
+（prompt + 比例/档位 + 参考图，sha256）在窗口内直接回同一条 451，不再打上游、
+不占槽位、不扣积分；响应带 `X-Content-Cache: hit` 便于排查。只缓存内容层面的
+终态拒绝，可重试错误一律不进缓存。
 
 ### 验证
 

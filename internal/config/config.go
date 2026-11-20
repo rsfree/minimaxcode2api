@@ -101,6 +101,18 @@ type Pool struct {
 	RefreshBefore      Duration `json:"refresh_before"`
 }
 
+// Cache 进程内负缓存的参数。
+type Cache struct {
+	// NegativeTTL 是「审核拒绝」结果的缓存时长：同一内容在该窗口内直接回 451，
+	// 不再打上游、不占槽位、不扣积分。0 = 关闭。
+	//
+	// 审核判定在分钟级稳定，缓存 10 分钟既挡住批量重放，又不至于挡住用户改完
+	// 内容再试。只缓存内容层面的终态拒绝，任何可重试错误都不进缓存。
+	NegativeTTL Duration `json:"negative_ttl"`
+	// NegativeMax 是缓存条数上限，超出淘汰最久未用的。
+	NegativeMax int `json:"negative_max"`
+}
+
 // Defaults 对外接口的缺省值。
 type Defaults struct {
 	Model     string `json:"model"`
@@ -165,6 +177,7 @@ type Config struct {
 	Upstream Upstream `json:"upstream"`
 	OAuth    OAuth    `json:"oauth"`
 	Pool     Pool     `json:"pool"`
+	Cache    Cache    `json:"cache"`
 	Defaults Defaults `json:"defaults"`
 	Models   Models   `json:"models"`
 	Logging  Logging  `json:"logging"`
@@ -213,6 +226,10 @@ func Default() *Config {
 			BreakerFailures:    3,
 			BreakerCooldown:    Duration(5 * time.Minute),
 			RefreshBefore:      Duration(10 * time.Minute),
+		},
+		Cache: Cache{
+			NegativeTTL: Duration(10 * time.Minute),
+			NegativeMax: 1000,
 		},
 		Defaults: Defaults{
 			Model:           "MiniMax-M3.1-Flash",
@@ -414,6 +431,11 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Pool.MaxWait <= 0 {
 		c.Pool.MaxWait = d.Pool.MaxWait
+	}
+	// NegativeTTL 用 == 0 判断而不是 <= 0：0 是「明确关闭」，不能被默认值盖掉；
+	// 缺字段时 Load 从 Default() 起底，本来就是 10 分钟。
+	if c.Cache.NegativeMax <= 0 {
+		c.Cache.NegativeMax = d.Cache.NegativeMax
 	}
 	if c.Pool.Cooldown429 <= 0 {
 		c.Pool.Cooldown429 = d.Pool.Cooldown429

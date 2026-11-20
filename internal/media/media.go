@@ -101,6 +101,14 @@ func (e *Error) IsRequest() bool {
 	return e.Code == http.StatusBadRequest || e.Code == http.StatusUnprocessableEntity
 }
 
+// IsContent 是否是内容/法务拦截（HTTP 451，或业务码 451）。
+//
+// 这类拒绝与账号健康无关：不该换号重试（同一 prompt 打到哪个号都一样），
+// 更不该计入账号失败 —— 否则一条敏感 prompt 就能把整个池打冷。
+func (e *Error) IsContent() bool {
+	return e.HTTPStatus == http.StatusUnavailableForLegalReasons || e.Code == http.StatusUnavailableForLegalReasons
+}
+
 // IsAuth 是否是凭据问题（该刷新/换号）。
 func (e *Error) IsAuth() bool {
 	return e.HTTPStatus == http.StatusUnauthorized || e.HTTPStatus == http.StatusForbidden ||

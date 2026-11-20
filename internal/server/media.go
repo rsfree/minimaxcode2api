@@ -76,6 +76,11 @@ func (s *Server) callMedia(ctx context.Context, tool string, payload any) ([]byt
 		if errors.As(cerr, &me) {
 			// 计费 / 参数 / "稍后再查"：换号无用，重试还可能打乱已计费任务。
 			// 但 raw 要带回去 —— 视频轮询的 503 里带着 status，客户端据它继续轮询。
+			if me.IsContent() {
+				// 内容拦截是请求层面的终态错误：换号只会把同一条 prompt
+				// 再打一遍（还占一次槽位），也不该记在账号头上。
+				return raw, cerr
+			}
 			if me.IsBilling() {
 				// 额度不足是**账号级**状态：必须把该账号打进冷却，否则下一个请求
 				// 立刻又会 Pick 到它，继续 402，直到人工发现。

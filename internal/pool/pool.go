@@ -7,6 +7,7 @@ package pool
 import (
 	"errors"
 	"math/rand"
+	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -115,6 +116,12 @@ func (p *Pool) Failure(id string, status int) {
 	cfg := p.cfg.Load().Pool
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if status == http.StatusUnavailableForLegalReasons {
+		// 审核/法务拦截（451）是内容层错误：既不代表账号坏了，也不该累计到
+		// 熔断里。计入的话，一条敏感 prompt 连续三次就能把账号打冷五分钟，
+		// 表现为"负缓存"——后续正常请求也被这段窗口挡住。
+		return
+	}
 	s := p.st(id)
 	s.failures++
 
