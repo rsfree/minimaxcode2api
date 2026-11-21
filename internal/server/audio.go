@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,44 @@ import (
 // 上游只收 URL / 内联 base64，超限的请求在网关侧就拦掉，不白占一次槽位。
 const maxAudioUpload = 25 << 20
 
+// speechSSEChunk 是 SSE 音频分片大小。16KiB 原始字节 → 约 21.8KiB base64，
+// 对长文本既不会产生上千个事件，也不会让单个事件过大。
+const speechSSEChunk = 16 << 10
+
+// voiceRef 兼容 OpenAI 的两种 voice 写法：字符串，或自定义音色对象 {"id":"..."}。
+// 2026 版 SDK 的 Voice 类型就是 string | VoiceID，只按 string 解析会直接 400。
+type voiceRef struct {
+	ID  string
+	Raw string
+}
+
+func (v *voiceRef) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	switch b[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		v.ID, v.Raw = s, s
+		return nil
+	case '{':
+		var obj struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(b, &obj); err != nil {
+			return err
+		}
+		v.ID, v.Raw = obj.ID, obj.ID
+		return nil
+	default:
+		return errors.New(`voice 必须是字符串或 {"id":"..."}`)
+	}
+}
+
 // speechRequest OpenAI /v1/audio/speech 的字段。
 //
 // 除 OpenAI 原生字段外还额外接受 volume / pitch / emotion（上游能力多于 OpenAI），
@@ -26,7 +65,7 @@ const maxAudioUpload = 25 << 20
 type speechRequest struct {
 	Model          string   `json:"model"`
 	Input          string   `json:"input"`
-	Voice          string   `json:"voice"`
+	Voice          voiceRef `json:"voice"`
 	Speed          float64  `json:"speed"`
 	Volume         *float64 `json:"volume"`
 	Pitch          *int     `json:"pitch"`
@@ -44,16 +83,18 @@ type speechResponse struct {
 	Message       string `json:"message"`
 }
 
-// handleSpeech 文本转语音，直接回音频字节（OpenAI 语义）。
+// handleSpeech 文本转语音（OpenAI 语义）。
 //
 // 上游给的是 CDN URL，网关必须自己下载再回吐：OpenAI 客户端期望响应体就是
 // 音频，而不是一个 JSON 里的链接。
 //
 // 兼容性取舍（详见 internal/audioproto）：
-//   - voice 支持 OpenAI 的 11 个音色名，按性别/语调映射到上游预置音色；
-//     非别名的取值一律原样透传（上游有 327 个音色，不做白名单）。
-//   - response_format 只认 OpenAI 六种取值；上游只能出 mp3，所以 mp3 之外的
-//     请求按 mp3 返回，并用 X-MiniMax-Format-Requested 标注"你要的没做到"。
+//   - voice 支持字符串与 {"id":"..."}；OpenAI 音色名按性别/语调映射到上游预置音色，
+//     其余取值原样透传（上游有 327 个音色，不做白名单）。
+//   - response_format 只认 OpenAI 六种取值；上游只能出 mp3，mp3 之外的请求按 mp3
+//     返回，并用 X-MiniMax-Format-Requested 标注。
+//   - stream_format=sse 按 OpenAI 事件格式回 speech.audio.delta / speech.audio.done
+//     （音频已整体生成，这里做的是分片下发，不是上游边生成边推）。
 //   - speed 收敛到上游 [0.5, 2.0]，收敛时回 X-MiniMax-Speed。
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -67,9 +108,11 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		writeFourKeyError(w, http.StatusBadRequest, "", "input", "invalid_request", "input 不能为空")
 		return
 	}
-	if sf := strings.TrimSpace(req.StreamFormat); sf != "" && !strings.EqualFold(sf, "audio") {
+	streamFormat := strings.ToLower(strings.TrimSpace(req.StreamFormat))
+	useSSE := streamFormat == "sse"
+	if streamFormat != "" && !useSSE && streamFormat != "audio" {
 		writeFourKeyError(w, http.StatusBadRequest, "", "stream_format", "unsupported_parameter",
-			"stream_format="+sf+" 不支持：网关回完整音频字节，不回 SSE 事件流")
+			"stream_format 只支持 sse / audio，收到 "+streamFormat)
 		return
 	}
 	format, native, ok := audioproto.NormalizeSpeechFormat(req.ResponseFormat)
@@ -86,7 +129,7 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]any{"text": text}
-	voiceID, mappedVoice := audioproto.ResolveVoice(req.Voice)
+	voiceID, mappedVoice := audioproto.ResolveVoice(req.Voice.ID)
 	if voiceID != "" {
 		payload["voice_id"] = voiceID
 	}
@@ -143,9 +186,6 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h := w.Header()
-	h.Set("Content-Type", mime)
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	h.Set("Content-Disposition", `inline; filename="speech.`+actual+`"`)
 	h.Set("X-MiniMax-Format", actual)
 	if !native {
 		// 显式降级：客户端要 wav/pcm/…，上游只出 mp3。请求本身合法，不报错，
@@ -156,21 +196,67 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		h.Set("X-MiniMax-Voice", voiceID)
 	}
 	if mappedVoice {
-		h.Set("X-MiniMax-Voice-Alias", strings.TrimSpace(req.Voice))
+		h.Set("X-MiniMax-Voice-Alias", strings.TrimSpace(req.Voice.Raw))
 	}
 	if clamped {
 		h.Set("X-MiniMax-Speed", strconv.FormatFloat(speed, 'f', -1, 64))
 	}
+
+	if useSSE {
+		// OpenAI 的 SSE 形态：event: speech.audio.delta + base64 分片，
+		// 以 speech.audio.done 结束。注意这条分支没有 Content-Length。
+		h.Set("Content-Type", "text/event-stream; charset=utf-8")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no") // nginx 不缓冲，否则分片会被攒成一坨
+		s.logMedia(r, req.Model, http.StatusOK, start, nil)
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < len(body); i += speechSSEChunk {
+			end := i + speechSSEChunk
+			if end > len(body) {
+				end = len(body)
+			}
+			writeSSE(w, flusher, "speech.audio.delta", map[string]any{
+				"type":  "speech.audio.delta",
+				"audio": base64.StdEncoding.EncodeToString(body[i:end]),
+			})
+		}
+		writeSSE(w, flusher, "speech.audio.done", map[string]any{
+			"type": "speech.audio.done",
+			// 上游不返回 token 用量，不编数字；OpenAI 的 usage 结构保留但置零。
+			"usage": map[string]int{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+		})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		return
+	}
+
+	h.Set("Content-Type", mime)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Set("Content-Disposition", `inline; filename="speech.`+actual+`"`)
 	s.logMedia(r, req.Model, http.StatusOK, start, nil)
 	_, _ = w.Write(body)
 }
 
 // transcriptionRequest 是转写接口的公共元数据（multipart 与 JSON 两种入参共用）。
+//
+// 2026 版 OpenAI 的参数面比上游宽得多。这里的原则是「字段全收、能力按上游」：
+// 上游没有对应参数的字段照样解析，不因解析失败 400；真正影响输出的字段
+// （response_format / stream）在 handler 里单独处理，其余忽略并在文档里写清。
 type transcriptionRequest struct {
-	Model          string `json:"model"`
-	Language       string `json:"language"`
-	Prompt         string `json:"prompt"`
-	ResponseFormat string `json:"response_format"`
+	Model          string   `json:"model"`
+	Language       string   `json:"language"`
+	Languages      []string `json:"languages"`
+	Prompt         string   `json:"prompt"`
+	ResponseFormat string   `json:"response_format"`
+	Stream         bool     `json:"stream"`
+
+	Temperature            *float64        `json:"temperature"`
+	TimestampGranularities []string        `json:"timestamp_granularities"`
+	Include                []string        `json:"include"`
+	ChunkingStrategy       json.RawMessage `json:"chunking_strategy"`
+	Keywords               []string        `json:"keywords"`
+	KnownSpeakerNames      []string        `json:"known_speaker_names"`
+	KnownSpeakerReferences []string        `json:"known_speaker_references"`
 }
 
 // handleTranscriptions 语音转文字。
@@ -182,13 +268,14 @@ type transcriptionRequest struct {
 // 上游只接受 URL 或内联 base64，不接受原始二进制流，所以 multipart 的文件
 // 会被转成 base64 内联上传。
 //
-// response_format：json / text / verbose_json 实现；srt / vtt 明确 400 ——
-// 上游 listen_audio 不返回时间戳，硬编会造成"字幕时间轴全错"这种更难查的问题。
-// language 上游没有该参数，只做接收与回显，不谎称做了语言限定。
+// response_format：json / text / verbose_json / diarized_json（降级）/ srt / vtt
+// （单条字幕，时间轴 = 0 → 音频真实时长）。stream=true 回 OpenAI 的
+// transcript.text.delta / transcript.text.done 事件流。
 func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	info := map[string]any{}
 	var meta transcriptionRequest
+	var audioBytes []byte // 仅用于 srt/vtt 算时长，不参与上游调用
 	ct := r.Header.Get("Content-Type")
 
 	switch {
@@ -227,12 +314,20 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 				fmt.Sprintf("音频超过 %d MB（OpenAI 上限）", maxAudioUpload>>20))
 			return
 		}
+		audioBytes = data
 		info["data"] = base64.StdEncoding.EncodeToString(data)
 		info["mime_type"] = sniffMime(data, hdr.Header.Get("Content-Type"))
 		meta.Model = r.FormValue("model")
 		meta.Language = r.FormValue("language")
 		meta.Prompt = r.FormValue("prompt")
 		meta.ResponseFormat = r.FormValue("response_format")
+		meta.Stream = parseFlexBool(r.FormValue("stream"))
+		meta.TimestampGranularities = formList(r, "timestamp_granularities[]", "timestamp_granularities")
+		meta.Include = formList(r, "include[]", "include")
+		meta.Languages = formList(r, "languages[]", "languages")
+		meta.Keywords = formList(r, "keywords[]", "keywords")
+		meta.KnownSpeakerNames = formList(r, "known_speaker_names[]", "known_speaker_names")
+		meta.KnownSpeakerReferences = formList(r, "known_speaker_references[]", "known_speaker_references")
 	default:
 		var body struct {
 			AudioURL string `json:"audio_url"`
@@ -255,8 +350,10 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case strings.TrimSpace(body.Data) != "":
-			info["data"] = strings.TrimSpace(body.Data)
+			rawData := strings.TrimSpace(body.Data)
+			info["data"] = rawData
 			info["mime_type"] = firstNonEmptyStr(strings.TrimSpace(body.MimeType), "audio/wav")
+			audioBytes, _ = decodeAudioData(rawData)
 		case strings.TrimSpace(body.AudioURL) != "" || strings.TrimSpace(body.URL) != "":
 			info["url"] = firstNonEmptyStr(strings.TrimSpace(body.AudioURL), strings.TrimSpace(body.URL))
 		default:
@@ -270,13 +367,26 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	format, ok := audioproto.NormalizeTranscriptionFormat(meta.ResponseFormat)
 	if !ok {
 		writeFourKeyError(w, http.StatusBadRequest, "", "response_format", "invalid_request",
-			"response_format 只支持 json / text / verbose_json / srt / vtt，收到 "+format)
+			"response_format 只支持 json / text / srt / verbose_json / vtt / diarized_json，收到 "+format)
 		return
 	}
-	if audioproto.NeedsTimestamps(format) {
-		writeFourKeyError(w, http.StatusBadRequest, "", "response_format", "unsupported_response_format",
-			"response_format="+format+" 需要逐句时间戳，上游 ASR 不提供；请改用 json / text / verbose_json")
-		return
+	// 字幕需要真实时长：上游不给，网关从上传字节里算（mp3 / wav / mp4）。
+	// 算不出来就明确拒绝，不编时间轴；这个检查放在调上游之前，避免白花一次额度。
+	// stream=true 时只产出文本增量事件，不需要时长，也就不做这个校验。
+	var subtitleDur time.Duration
+	if !meta.Stream && (format == audioproto.TranscribeSRT || format == audioproto.TranscribeVTT) {
+		if len(audioBytes) == 0 {
+			writeFourKeyError(w, http.StatusBadRequest, "", "response_format", "unsupported_response_format",
+				"response_format="+format+" 需要音频字节来推算时长；JSON 的 url 入参请改用 multipart 或 data（base64）")
+			return
+		}
+		d, ok := audioproto.MediaDuration(audioBytes)
+		if !ok {
+			writeFourKeyError(w, http.StatusBadRequest, "", "response_format", "unsupported_response_format",
+				"response_format="+format+" 需要音频时长，当前容器无法解析（支持 mp3 / wav / m4a / mp4）；请改用 json / text / verbose_json")
+			return
+		}
+		subtitleDur = d
 	}
 	if p := strings.TrimSpace(meta.Prompt); p != "" {
 		info["prompt"] = p
@@ -308,6 +418,27 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logMedia(r, model, http.StatusOK, start, nil)
 
+	// stream 优先于 response_format：OpenAI 的流式转写只产出文本增量事件。
+	if meta.Stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		if format != audioproto.TranscribeJSON && format != audioproto.TranscribeText {
+			w.Header().Set("X-MiniMax-Response-Format", audioproto.TranscribeJSON)
+		}
+		flusher, _ := w.(http.Flusher)
+		// 上游一次性给全文，这里发一个 delta 即全文，再发 done。事件结构按
+		// OpenAI 的 TranscriptionStreamEvent，SDK 的 Stream 能直接解析。
+		writeSSE(w, flusher, "transcript.text.delta", map[string]any{
+			"type": "transcript.text.delta", "delta": text,
+		})
+		writeSSE(w, flusher, "transcript.text.done", map[string]any{
+			"type": "transcript.text.done", "text": text,
+		})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		return
+	}
+
 	switch format {
 	case audioproto.TranscribeText:
 		// OpenAI 的 text 形态就是纯文本，不是 JSON。SDK 会按这个 Content-Type
@@ -315,22 +446,84 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, text)
 	case audioproto.TranscribeVerboseJSON:
+		warnings := []string{
+			"上游 ASR 不返回时间戳与分段：segments 为空，duration 省略；" +
+				"language 回显的是请求里的提示值，不是检测结果",
+		}
+		if len(meta.TimestampGranularities) > 0 {
+			warnings = append(warnings, "timestamp_granularities 已接收，但上游不提供词级/段级时间戳")
+		}
+		if len(meta.Include) > 0 {
+			warnings = append(warnings, "include=logprobs 已接收，但上游不返回对数概率")
+		}
 		out := map[string]any{
 			"task":     "transcribe",
 			"text":     text,
 			"segments": []any{},
-			"warnings": []string{
-				"上游 ASR 不返回时间戳与分段：segments 为空，duration 省略；" +
-					"language 回显的是请求里的提示值，不是检测结果",
-			},
+			"warnings": warnings,
 		}
 		if lang := strings.ToLower(strings.TrimSpace(meta.Language)); lang != "" {
 			out["language"] = lang
 		}
 		writeJSON(w, http.StatusOK, out)
+	case audioproto.TranscribeSRT, audioproto.TranscribeVTT:
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, audioproto.Subtitles(format, text, subtitleDur))
+	case audioproto.TranscribeDiarizedJSON:
+		// 上游没有说话人分离：字段对齐（segments 存在），但不伪造 speaker。
+		w.Header().Set("X-MiniMax-Response-Format", audioproto.TranscribeJSON)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"task": "transcribe", "text": text, "segments": []any{},
+			"warnings": []string{"上游不支持说话人分离：segments 为空，没有 speaker 字段"},
+		})
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"text": text})
 	}
+}
+
+// writeSSE 写一个 OpenAI 形态的事件。data 里的 type 由调用方给，
+// 确保与 event: 行一致（SDK 同时看 event 与 JSON 的 type 字段）。
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, data any) {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// parseFlexBool 接受 multipart 里常见的 true/1/on（SDK 发 "true"）。
+func parseFlexBool(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// formList 读 multipart 的数组字段。OpenAI SDK 用 `field[]` 形式重复提交。
+func formList(r *http.Request, keys ...string) []string {
+	var out []string
+	for _, k := range keys {
+		out = append(out, r.Form[k]...)
+	}
+	return out
+}
+
+// decodeAudioData 解码 base64；顺带兼容 data URL（data:audio/wav;base64,...）。
+func decodeAudioData(s string) ([]byte, bool) {
+	if strings.HasPrefix(s, "data:") {
+		if i := strings.Index(s, ","); i > 0 {
+			s = s[i+1:]
+		}
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // musicRequest 音乐生成。上游 prompt 要求 10-300 字，lyrics 10-600 字。

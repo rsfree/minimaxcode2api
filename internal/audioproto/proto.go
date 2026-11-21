@@ -39,6 +39,8 @@ var openAIVoices = map[string]string{
 	"shimmer": "female-tianmei",           // 柔和女声
 	"sage":    "female-yujie",             // 沉静女声
 	"coral":   "female-chengshu",          // 温暖成熟女声
+	"marin":   "female-shaonv-jingpin",    // 2026 新增的自然女声
+	"cedar":   "male-qn-jingying-jingpin", // 2026 新增的自然男声
 }
 
 // ResolveVoice 把 voice 字段解析成上游 voice_id。
@@ -139,11 +141,14 @@ const (
 	TranscribeVerboseJSON = "verbose_json"
 	TranscribeSRT         = "srt"
 	TranscribeVTT         = "vtt"
+	// TranscribeDiarizedJSON 是 2026 版 OpenAI 的说话人分离格式。
+	// 上游没有 diarization，网关降级成 json + 空 segments（字段在，能力不在）。
+	TranscribeDiarizedJSON = "diarized_json"
 )
 
 var openAITranscribeFormats = map[string]bool{
 	TranscribeJSON: true, TranscribeText: true, TranscribeVerboseJSON: true,
-	TranscribeSRT: true, TranscribeVTT: true,
+	TranscribeSRT: true, TranscribeVTT: true, TranscribeDiarizedJSON: true,
 }
 
 // NormalizeTranscriptionFormat 归一化 response_format，空值按 OpenAI 默认 json。

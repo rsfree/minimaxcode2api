@@ -306,8 +306,8 @@ export ANTHROPIC_MODEL=MiniMax-M3.1-Flash
 |---|---|---|
 | `POST /v1/images/generations` | OpenAI 图像协议（canonical），见下节 | ✅ 真调 + schema 全验 |
 | 视频四个端点 | 异步视频协议（canonical），见下节 | ✅ 提交/查询/列表/删除全验 |
-| `POST /v1/audio/speech` | 文本转语音，OpenAI 音色名 / response_format / speed 已适配 | ✅ 真调 + OpenAI SDK 通过 |
-| `POST /v1/audio/transcriptions` | 语音转文字，multipart / JSON，json / text / verbose_json | ✅ 真调 + OpenAI SDK 通过 |
+| `POST /v1/audio/speech` | 文本转语音，支持 voice 对象 / SSE / OpenAI 六种格式降级 | ✅ 真调 + OpenAI SDK 通过 |
+| `POST /v1/audio/transcriptions` | 语音转文字，json / text / verbose_json / srt / vtt / diarized_json + stream | ✅ 真调 + OpenAI SDK 通过 |
 | `POST /v1/audio/music` | 音乐生成，默认回字节，`response_format=url` 回链接 | ✅ 真调通过 |
 | `GET /v1/voices` | 音色列表（实测 327 个） | ✅ 真调通过 |
 | `POST /v1/images/remove-background` | 抠图 → 透明 PNG（回顶层 `output_url`） | ✅ 真调通过 |
@@ -677,13 +677,15 @@ pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
 
 | 字段 | 处理 |
 |---|---|
-| `voice` | OpenAI 的 11 个音色名按性别/语调映射到上游预置音色（见下表）；其余值原样透传，可直传 327 个 `voice_id` |
-| `response_format`（speech） | 只认 OpenAI 六种取值；上游只能出 **mp3**，`wav/pcm/opus/aac/flac` 按 mp3 返回，并在响应头标注 |
-| `speed` | OpenAI `0.25–4.0`，上游 `0.5–2.0`；落在外圈时收敛，收敛值放响应头 |
-| `stream_format` | 只接受 `audio`；`sse` 明确 400（网关不产生 SSE 音频事件） |
+| `voice` | 字符串或 `{"id":"..."}` 都接受；OpenAI 13 个音色名映射到上游预置音色（见下表），其余值原样透传（327 个 `voice_id` 可用） |
+| `response_format`（speech） | OpenAI 六种取值全收；上游只能出 **mp3**，`wav/pcm/opus/aac/flac` 按 mp3 返回，并在响应头标注 |
+| `stream_format`（speech） | `audio`（默认）回二进制；`sse` 回 `speech.audio.delta` + `speech.audio.done` 事件流（网关把已生成的音频分片下发，不是上游边生成边推） |
+| `speed` | OpenAI `0.25–4.0` 校验，收敛到上游 `0.5–2.0`，收敛值放响应头 |
 | `instructions` | 接受但忽略（上游无等价参数） |
-| `language`（ASR） | 接受但不下发；`verbose_json` 里回显的是**请求提示值**，不是检测结果 |
-| `response_format`（ASR） | `json` / `text` / `verbose_json` 实现；`srt` / `vtt` 在网关侧 400（上游无时间戳，硬编会产出全错的时间轴） |
+| `language` / `languages`（ASR） | 接受但不下发；`verbose_json` 回显 `language`，并明确它是**请求提示值**而不是检测结果 |
+| `response_format`（ASR） | `json` / `text` / `verbose_json` 原生；`srt` / `vtt` 生成**单条字幕**（时间轴 0 → 音频真实时长，mp3/wav/m4a 可解析）；`diarized_json` 降级为 json + 空 `segments` |
+| `stream`（ASR） | 支持：回 `transcript.text.delta` / `transcript.text.done`。上游一次给全文，所以只有一个 delta |
+| `temperature` / `timestamp_granularities` / `include` / `chunking_strategy` / `keywords` / `known_speaker_*` | 全部接收；上游没有对应能力，忽略并在 `verbose_json` 的 `warnings` 里注明 |
 | `file` 大小 | 25MB 上限（对齐 OpenAI），超限 413 |
 
 **音色映射**（近似映射：对齐性别与语调，不承诺听感与 OpenAI 一致）：
@@ -695,7 +697,8 @@ pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
 | fable | male-qn-jingying-jingpin | sage | female-yujie |
 | onyx | male-qn-badao | coral | female-chengshu |
 | ash | male-qn-daxuesheng | ballad | male-qn-badao-jingpin |
-| verse | male-qn-qingse-jingpin | | |
+| verse | male-qn-qingse-jingpin | marin | female-shaonv-jingpin |
+| cedar | male-qn-jingying-jingpin | | |
 
 ### 降级与诊断头
 
@@ -708,20 +711,24 @@ pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
 | `X-MiniMax-Format-Requested` | 仅在实际格式 ≠ 请求格式时出现 |
 | `X-MiniMax-Voice` / `X-MiniMax-Voice-Alias` | 实际下发的 `voice_id` / 命中的 OpenAI 别名 |
 | `X-MiniMax-Speed` | 仅当 speed 被收敛时出现，值为实际下发值 |
+| `X-MiniMax-Response-Format` | ASR 的降级结果（如 `diarized_json → json`） |
 
-`verbose_json` 的 `segments` 恒为空数组，并带一条 `warnings` 说明上游不返回时间戳。
+`verbose_json` 的 `segments` 恒为空数组，并带 `warnings` 说明上游不返回时间戳；
+srt/vtt 的时间轴来自网关侧解析的音频时长，不是上游返回。
 
 ### 实测记录（2026-11-21）
 
-用官方 `openai` Python SDK（2.x）直连网关，不是 curl 自证：
+TTS / ASR 基础链路用**真实上游**验过；下面这些协议层能力用官方 `openai`
+Python SDK（2.x）+ 本地假上游验证（不消耗额度，也不依赖上游是否支持）：
 
 | 调用 | 结果 |
 |---|---|
-| `audio.speech.create(model="tts-1", voice="nova")` | 200，`audio/mpeg`，`X-MiniMax-Voice: female-shaonv` |
-| `audio.transcriptions.create(..., response_format="text")` | 返回 `str`（纯文本，不是 JSON 字符串） |
-| `audio.transcriptions.create(...)`（默认 json） | 返回 `Transcription` 对象，`.text` 可直接读 |
-| `audio.transcriptions.create(..., response_format="verbose_json")` | 返回 `TranscriptionVerbose`，`segments=[]`、`task=transcribe` |
-| `response_format="srt"` | 400 `unsupported_response_format`，**不打上游** |
+| `speech.create(voice={"id":"Nova"})` | 200，`X-MiniMax-Voice: female-shaonv`（对象写法可用） |
+| `speech.create(..., stream_format="sse")` | `text/event-stream`，3 个 delta 拼回 41734 字节，随后 `speech.audio.done` + `[DONE]` |
+| `transcriptions.create(..., stream=True)` | SDK 依次产出 `transcript.text.delta` / `transcript.text.done` |
+| `transcriptions.create(..., response_format="srt")` | 返回 `str`，单条 cue（`00:00:00,000 --> 00:00:02,592`） |
+| `transcriptions.create(..., response_format="diarized_json")` | 返回 `TranscriptionDiarized`，`segments=[]` |
+| `temperature` / `timestamp_granularities` / `include` / `chunking_strategy` / `languages` / `keywords` / `known_speaker_names` | 全部接收，`verbose_json` 里带对应 `warnings` |
 
 ## 扩展能力（同步视频 / 图像工具 / 理解类）
 
@@ -852,6 +859,8 @@ curl $BASE/v1/images/describe -H "Authorization: Bearer $KEY" \
 - 不做语音格式转码：上游 TTS 只出 mp3，`wav/pcm/opus/aac/flac` 目前按 mp3 降级并
   在响应头标注。内置 ffmpeg 可做到全兼容，但镜像会从 ~20MB 涨到 ~100MB，
   2026-11-21 与用户确认先不引入；
+- 不做逐句/逐词时间戳与说话人分离：srt/vtt 是**单条字幕**（0 → 音频真实时长），
+  `diarized_json` 降级为 json + 空 `segments`，不伪造 speaker；
 - 不做**联网搜索**的独立路由（上游 `web_search` 属 agent 内部工具）；
   图片/视频/音频的**理解**已由 `/v1/images/describe`、`/v1/videos/understand`、
   `/v1/audio/understand` 三条确定路由承担，不再走 chat 端点赌媒体块能不能过；

@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -139,7 +141,7 @@ func TestSpeechRejectsInvalidParams(t *testing.T) {
 		{"空 input", `{"input":"  "}`, "input"},
 		{"非法 response_format", `{"input":"hi","response_format":"ogg"}`, "response_format"},
 		{"speed 越界", `{"input":"hi","speed":5}`, "speed"},
-		{"sse 流", `{"input":"hi","stream_format":"sse"}`, "stream_format"},
+		{"非法 stream_format", `{"input":"hi","stream_format":"multipart"}`, "stream_format"},
 	}
 	for _, c := range cases {
 		resp, raw := f.post(t, "/v1/audio/speech", c.body)
@@ -282,7 +284,8 @@ func TestTranscriptionsVerboseJSON(t *testing.T) {
 	}
 }
 
-func TestTranscriptionsSRTRejectedBeforeUpstream(t *testing.T) {
+// 容器识别不出来时 srt 仍然要拒绝：宁可不给字幕，也不编时间轴。
+func TestTranscriptionsSRTRejectsUnparsableContainer(t *testing.T) {
 	var mu sync.Mutex
 	var got map[string]any
 	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
@@ -303,7 +306,239 @@ func TestTranscriptionsSRTRejectedBeforeUpstream(t *testing.T) {
 		t.Fatalf("code = %q，期望 unsupported_response_format", out.Error.Code)
 	}
 	if f.upCalls() != 0 {
-		t.Fatalf("srt 应在网关侧拒绝，不该打上游；实际 %d 次", f.upCalls())
+		t.Fatalf("算不出时长应在网关侧拒绝，不该打上游；实际 %d 次", f.upCalls())
+	}
+}
+
+// validWAV 生成 2 秒 16kHz/16bit/mono 的合法 WAV（带 fmt 与 data chunk）。
+func validWAV() []byte {
+	const sampleRate, channels, bits = 16000, 1, 16
+	dataSize := sampleRate * channels * bits / 8 * 2
+	b := make([]byte, 44+dataSize)
+	copy(b[0:], "RIFF")
+	binary.LittleEndian.PutUint32(b[4:], uint32(36+dataSize))
+	copy(b[8:], "WAVE")
+	copy(b[12:], "fmt ")
+	binary.LittleEndian.PutUint32(b[16:], 16)
+	binary.LittleEndian.PutUint16(b[20:], 1)
+	binary.LittleEndian.PutUint16(b[22:], channels)
+	binary.LittleEndian.PutUint32(b[24:], sampleRate)
+	binary.LittleEndian.PutUint32(b[28:], sampleRate*channels*bits/8)
+	binary.LittleEndian.PutUint16(b[32:], channels*bits/8)
+	binary.LittleEndian.PutUint16(b[34:], bits)
+	copy(b[36:], "data")
+	binary.LittleEndian.PutUint32(b[40:], uint32(dataSize))
+	return b
+}
+
+func TestTranscriptionsSRT(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", validWAV(), map[string]string{
+		"response_format": "srt",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+	want := "1\n00:00:00,000 --> 00:00:02,000\n你好，这是一次兼容性测试。\n"
+	if string(raw) != want {
+		t.Fatalf("SRT 内容 = %q，期望 %q", raw, want)
+	}
+}
+
+func TestTranscriptionsDiarizedJSONDegrades(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"response_format": "diarized_json",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("响应不是 JSON: %v", err)
+	}
+	if _, ok := out["segments"].([]any); !ok {
+		t.Fatalf("diarized_json 必须保留 segments 字段（空数组），得到 %v", out)
+	}
+	if resp.Header.Get("X-MiniMax-Response-Format") != "json" {
+		t.Fatalf("降级应回 X-MiniMax-Response-Format: json，得到 %q",
+			resp.Header.Get("X-MiniMax-Response-Format"))
+	}
+}
+
+// parseSSE 把响应体拆成 (event, data) 列表；data 是 JSON 对象。
+func parseSSE(t *testing.T, raw []byte) []struct {
+	Event string
+	Data  map[string]any
+} {
+	t.Helper()
+	var out []struct {
+		Event string
+		Data  map[string]any
+	}
+	for _, block := range strings.Split(string(raw), "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" || block == "data: [DONE]" {
+			continue
+		}
+		var ev struct {
+			Event string
+			Data  map[string]any
+		}
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				ev.Event = strings.TrimSpace(strings.TrimPrefix(line, "event: "))
+			}
+			if strings.HasPrefix(line, "data: ") {
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev.Data); err != nil {
+					t.Fatalf("SSE data 不是 JSON: %v（block=%q）", err, block)
+				}
+			}
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestSpeechSSE(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeAudioServer(t, &mu, &got, false), "tok1")
+
+	resp, raw := f.post(t, "/v1/audio/speech",
+		`{"model":"tts-1","voice":"nova","input":"你好","stream_format":"sse"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q，SSE 必须是 text/event-stream", ct)
+	}
+	if !strings.Contains(string(raw), "[DONE]") {
+		t.Fatal("SSE 结尾应有 data: [DONE]")
+	}
+	events := parseSSE(t, raw)
+	if len(events) < 2 {
+		t.Fatalf("事件数 = %d，至少应有 delta + done", len(events))
+	}
+	var audio []byte
+	for _, ev := range events {
+		switch ev.Event {
+		case "speech.audio.delta":
+			chunk, err := base64.StdEncoding.DecodeString(ev.Data["audio"].(string))
+			if err != nil {
+				t.Fatalf("delta.audio 不是 base64: %v", err)
+			}
+			audio = append(audio, chunk...)
+		case "speech.audio.done":
+			if ev.Data["type"] != "speech.audio.done" {
+				t.Fatalf("done.type = %v", ev.Data["type"])
+			}
+		default:
+			t.Fatalf("未知事件 %q", ev.Event)
+		}
+	}
+	if !strings.HasPrefix(string(audio), "ID3") {
+		t.Fatalf("分片拼回来的音频不对: %q", audio)
+	}
+}
+
+func TestSpeechVoiceObject(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeAudioServer(t, &mu, &got, false), "tok1")
+
+	resp, raw := f.post(t, "/v1/audio/speech",
+		`{"model":"tts-1","voice":{"id":"Nova"},"input":"hi"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	if v := resp.Header.Get("X-MiniMax-Voice"); v != "female-shaonv" {
+		t.Fatalf("X-MiniMax-Voice = %q，期望 female-shaonv", v)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got["voice_id"] != "female-shaonv" {
+		t.Fatalf("上游 voice_id = %v", got["voice_id"])
+	}
+}
+
+func TestTranscriptionsStream(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":           "gpt-4o-transcribe",
+		"response_format": "json",
+		"stream":          "true",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q，stream=true 必须是 text/event-stream", ct)
+	}
+	events := parseSSE(t, raw)
+	if len(events) != 2 {
+		t.Fatalf("事件数 = %d，期望 delta + done", len(events))
+	}
+	if events[0].Event != "transcript.text.delta" || events[0].Data["delta"] != "你好，这是一次兼容性测试。" {
+		t.Fatalf("delta 事件不对: %+v", events[0])
+	}
+	if events[1].Event != "transcript.text.done" || events[1].Data["text"] != "你好，这是一次兼容性测试。" {
+		t.Fatalf("done 事件不对: %+v", events[1])
+	}
+}
+
+func TestTranscriptionsStreamIgnoresSubtitleFormat(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	// stream=true 只产出文本事件，不该因为容器解析不出时长而 400。
+	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"response_format": "srt",
+		"stream":          "true",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200，body=%s", resp.StatusCode, raw)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+}
+
+func TestTranscriptionsAcceptsExtendedFields(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	// 2026 版 OpenAI 的字段：网关必须全部收下，不因不认识而 400。
+	resp, raw := f.post(t, "/v1/audio/transcriptions", `{
+		"data":"UklGRg==","mime_type":"audio/wav","model":"gpt-4o-transcribe",
+		"language":"zh","languages":["zh","en"],"prompt":"上下文",
+		"temperature":0.2,"timestamp_granularities":["word","segment"],
+		"include":["logprobs"],"chunking_strategy":"auto",
+		"keywords":["MiniMax"],"known_speaker_names":["客服"],
+		"known_speaker_references":[],"response_format":"verbose_json"
+	}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	warns, _ := out["warnings"].([]any)
+	if len(warns) < 2 {
+		t.Fatalf("timestamp_granularities / include 应各产生一条 warning，得到 %v", out["warnings"])
 	}
 }
 
