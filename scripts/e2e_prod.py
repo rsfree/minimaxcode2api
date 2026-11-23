@@ -229,7 +229,7 @@ check("G 视频", "同步门未知任务 404", st == 404, f"HTTP {st}")
 expect_err("H 音频", "speech 缺 input → 400", "/v1/audio/speech", {"voice": "female-shaonv"}, 400, "invalid_request", AUTH)
 expect_err("H 音频", "music prompt 太短 → 400", "/v1/audio/music", {"prompt": "太短"}, 400, "invalid_request", AUTH)
 st, _, d, _ = call("POST", "/v1/audio/transcriptions", b"--x--", {"Authorization": "Bearer " + KEY, "Content-Type": "text/plain"})
-check("H 音频", "转写非法载体 → 400", st == 400, f"HTTP {st}")
+check("H 音频", "转写非法载体 → 415", st == 415, f"HTTP {st}")
 st, vh, d, _ = call("GET", "/v1/voices", headers=AUTH)
 if st == 200:
     check("H 音频", "音色列表 200", len(d.get("data", [])) > 100, f"n={len(d.get('data', []))}")

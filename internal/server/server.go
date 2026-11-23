@@ -31,7 +31,7 @@ import (
 
 // Version 网关版本。发布流水线会把它写回成与 tag 一致的值（见 release.yml 的 bump 步骤），
 // 所以这里必须保持 `const Version = "x.y.z"` 的单一写法，别改成 var 或加构建期注入。
-const Version = "0.6.9"
+const Version = "0.7.0"
 
 // Server 网关主对象。
 type Server struct {
@@ -145,6 +145,8 @@ func (s *Server) routes() {
 	// 一次调用直达 output_url（上游自带轮询）。
 	s.Mux.HandleFunc("POST /v1/contents/generations", s.auth(s.syncVideoGeneration))
 	s.Mux.HandleFunc("GET /v1/voices", s.auth(s.handleVoices))
+	// 语音能力声明（本部署实际接受的取值面；docs/audio-capabilities.md 的机器可读版）。
+	s.Mux.HandleFunc("GET /v1/audio/capabilities", s.auth(s.handleAudioCapabilities))
 	s.Mux.HandleFunc("POST /v1/audio/speech", s.auth(s.handleSpeech))
 	s.Mux.HandleFunc("POST /v1/audio/transcriptions", s.auth(s.handleTranscriptions))
 	s.Mux.HandleFunc("POST /v1/audio/music", s.auth(s.handleMusic))

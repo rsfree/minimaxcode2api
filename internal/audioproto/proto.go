@@ -1,18 +1,22 @@
-// Package audioproto 定义 OpenAI 音频协议与上游能力之间的映射规则。
+// Package audioproto 声明本部署的语音能力面，并把 OpenAI 骨架字段收敛到上游。
 //
-// OpenAI 与上游（MiniMax Code 的 MCP 媒体工具）并不对等，差异全部集中在这里：
+// 原则（来自 audio-adapter 规范）：**北向只承诺契约，不承诺厂商能力**。
+// OpenAI 文档里的枚举、默认值、数值区间都只是参考；本部署实际接受什么，
+// 以本文件的声明为准，并同步写在 docs/audio-capabilities.md。
 //
-//	OpenAI 字段                          上游
-//	speech.voice = alloy/echo/…          synthesize_speech.voice_id = male-qn-qingse 等预置音色
-//	speech.speed = 0.25–4.0              speed = 0.5–2.0
-//	speech.response_format = mp3/…       **只能出 mp3**（schema 里没有 format 字段）
-//	transcriptions.response_format=srt   listen_audio **不返回时间戳**
+// 本部署的声明（不是 OpenAI 的参考值）：
 //
-// 处理原则分三档，handler 只按这里的结论执行：
+//	speech.response_format  只有 mp3（上游 synthesize_speech 没有 format 参数）
+//	speech.speed            0.5–2.0（上游 schema 原文），超出直接 400，不钳位
+//	speech.input            1–10000 字符（上游官方 TTS 上限）
+//	speech.voice            13 个 OpenAI 别名 + 任意原生 voice_id 直传
+//	speech.instructions     不支持（上游无等价参数）→ 400
+//	speech.stream_format    audio / sse（sse 为网关扩展）
+//	speech 扩展字段          volume / pitch / emotion（上游能力，OpenAI 没有）
 //
-//	能等价映射   → 映射（音色、speed 区间）
-//	不能等价     → 显式降级，并在响应头标注实际格式（mp3 之外的 response_format）
-//	根本做不到   → 明确 400，不假装支持（srt / vtt）
+//	transcriptions.response_format  json / text / verbose_json；srt/vtt 需要真实分段，
+//	                                上游不提供 → 400；diarized_json 无说话人分离 → 400
+//	transcriptions.language/prompt/temperature/timestamp_granularities/...  → 400
 package audioproto
 
 import "strings"
@@ -21,16 +25,16 @@ import "strings"
 
 // openAIVoices 是 OpenAI 预置音色名 → MiniMax 预置 voice_id 的近似映射。
 //
-// 为什么只能"近似"：OpenAI 没有公开这 11 个音色的声学参数，能对齐的只有
+// 为什么只能"近似"：OpenAI 没有公开这 13 个音色的声学参数，能对齐的只有
 // 性别、年龄感与语调（如 onyx 低沉男声、nova 清亮女声）。这里挑的是上游
 // 8 个基础预置音色（male-qn-* / female-*）及其 -jingpin 变体，中文场景下
 // 稳定可用；调用方要精确音色时直接传 voice_id（会原样透传，不走本表）。
 //
 // 键必须小写：OpenAI 客户端常把音色名转小写，客户端手写时又可能首字母大写。
 var openAIVoices = map[string]string{
-	"alloy":   "male-qn-qingse",           // 中性、年轻；同时是上游默认音色，保持既有行为
+	"alloy":   "male-qn-qingse",           // 中性、年轻；同时是上游默认音色
 	"echo":    "male-qn-jingying",         // 清晰男声
-	"fable":   "male-qn-jingying-jingpin", // 叙述感男声（beta 音色，音色更饱满）
+	"fable":   "male-qn-jingying-jingpin", // 叙述感男声（beta）
 	"onyx":    "male-qn-badao",            // 低沉、权威
 	"ash":     "male-qn-daxuesheng",       // 年轻男声
 	"verse":   "male-qn-qingse-jingpin",   // 通用男声
@@ -39,15 +43,14 @@ var openAIVoices = map[string]string{
 	"shimmer": "female-tianmei",           // 柔和女声
 	"sage":    "female-yujie",             // 沉静女声
 	"coral":   "female-chengshu",          // 温暖成熟女声
-	"marin":   "female-shaonv-jingpin",    // 2026 新增的自然女声
-	"cedar":   "male-qn-jingying-jingpin", // 2026 新增的自然男声
+	"marin":   "female-shaonv-jingpin",    // 2026 新增自然女声
+	"cedar":   "male-qn-jingying-jingpin", // 2026 新增自然男声
 }
 
 // ResolveVoice 把 voice 字段解析成上游 voice_id。
 //
-// 命中 OpenAI 别名时第二个返回值为 true（handler 据此回报 X-MiniMax-Voice-Alias）；
-// 未命中的一律原样透传 —— 上游有 327 个音色，网关不做白名单校验，否则
-// 用户自建/克隆音色会被误伤。
+// 命中 OpenAI 别名时第二个返回值为 true；未命中的一律原样透传 —— 上游有
+// 327 个预置音色且可能存在克隆音色，网关不做白名单校验。
 func ResolveVoice(name string) (id string, mapped bool) {
 	n := strings.TrimSpace(name)
 	if n == "" {
@@ -59,7 +62,7 @@ func ResolveVoice(name string) (id string, mapped bool) {
 	return n, false
 }
 
-// OpenAIVoices 返回别名表的副本（供文档/测试使用）。
+// OpenAIVoices 返回别名表的副本（供文档/测试/能力接口使用）。
 func OpenAIVoices() map[string]string {
 	out := make(map[string]string, len(openAIVoices))
 	for k, v := range openAIVoices {
@@ -68,81 +71,82 @@ func OpenAIVoices() map[string]string {
 	return out
 }
 
-// ---------- response_format（speech） ----------
+// ---------- speech 参数面 ----------
 
-// FormatMP3 是上游唯一能产出的音频格式。
+// FormatMP3 是本部署唯一声明的输出格式。
 const FormatMP3 = "mp3"
 
-// openAISpeechFormats 是 OpenAI /v1/audio/speech 的合法取值。
-var openAISpeechFormats = map[string]bool{
-	"mp3": true, "opus": true, "aac": true, "flac": true, "wav": true, "pcm": true,
-}
+// MaxSpeechInput 是上游官方 TTS 的文本上限。
+const MaxSpeechInput = 10000
 
-// NormalizeSpeechFormat 归一化 response_format。
+const (
+	// SpeedMin / SpeedMax 是上游 synthesize_speech schema 声明的区间。
+	SpeedMin = 0.5
+	SpeedMax = 2.0
+	// 上游没有声明的扩展字段边界。
+	VolumeMin = 0.0
+	VolumeMax = 10.0
+	PitchMin  = -12
+	PitchMax  = 12
+)
+
+// SupportedSpeechFormat 本部署只声明 mp3。
 //
-// 返回值：
-//
-//	format 规整后的格式名（空值按 OpenAI 默认 mp3）
-//	native 上游能否原生输出该格式（当前只有 mp3 为 true）
-//	ok     是否为 OpenAI 合法取值（false 时调用方应回 400）
-//
-// 注意 native=false 不代表报错：mp3 之外的格式按"降级为 mp3 + 响应头标注"处理，
-// 这是 2026-11-21 与用户确认的取舍（上游 TTS 无 format 参数，转码需要额外依赖）。
-func NormalizeSpeechFormat(s string) (format string, native bool, ok bool) {
+// 返回 (规整后的取值, 是否支持)。空值按默认 mp3。
+func SupportedSpeechFormat(s string) (format string, ok bool) {
 	f := strings.ToLower(strings.TrimSpace(s))
 	if f == "" {
 		f = FormatMP3
 	}
-	if !openAISpeechFormats[f] {
-		return f, false, false
-	}
-	return f, f == FormatMP3, true
+	return f, f == FormatMP3
 }
 
-// ---------- speed ----------
-
-const (
-	// OpenAI 允许的 speed 区间。
-	OpenAISpeedMin = 0.25
-	OpenAISpeedMax = 4.0
-	// 上游 synthesize_speech 的 speed 区间（schema 原文 [0.5, 2.0]）。
-	UpstreamSpeedMin = 0.5
-	UpstreamSpeedMax = 2.0
-)
-
-// ClampSpeed 校验并收敛 speed。
+// ValidateSpeed 校验 speed 是否落在本部署声明的区间内。
 //
-// 0 视为"未指定"（JSON 缺省与显式 0 不可区分，OpenAI 也不接受 0）。
-// 超出 OpenAI 区间 → ok=false（调用方回 400）。
-// 在 OpenAI 区间但超出上游区间 → 收敛并置 clamped=true（响应头标注实际值），
-// 因为 3.0 这类请求在上游会直接 400，收敛比整条请求失败更有用。
-func ClampSpeed(v float64) (speed float64, clamped bool, ok bool) {
+// 0 视为"未指定"（JSON 缺省与显式 0 不可区分）。超出 [0.5, 2.0] 返回 false，
+// 调用方必须 400 —— 不做钳位：钳位后返回 200 属于静默降级。
+func ValidateSpeed(v float64) (float64, bool) {
 	if v == 0 {
-		return 0, false, true
+		return 0, true
 	}
-	if v < OpenAISpeedMin || v > OpenAISpeedMax {
-		return 0, false, false
+	if v < SpeedMin || v > SpeedMax {
+		return 0, false
 	}
-	switch {
-	case v < UpstreamSpeedMin:
-		return UpstreamSpeedMin, true, true
-	case v > UpstreamSpeedMax:
-		return UpstreamSpeedMax, true, true
-	default:
-		return v, false, true
-	}
+	return v, true
 }
 
-// ---------- response_format（transcriptions） ----------
+// ValidateVolume 校验扩展字段 volume。
+func ValidateVolume(v float64) bool { return v >= VolumeMin && v <= VolumeMax }
+
+// ValidatePitch 校验扩展字段 pitch。
+func ValidatePitch(v int) bool { return v >= PitchMin && v <= PitchMax }
+
+// emotions 是上游 synthesize_speech 声明的情绪枚举。
+var emotions = map[string]bool{
+	"happy": true, "sad": true, "angry": true, "fearful": true,
+	"disgusted": true, "surprised": true, "neutral": true,
+}
+
+// ValidateEmotion 校验扩展字段 emotion（空值表示不指定）。
+func ValidateEmotion(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "" || emotions[s]
+}
+
+// Emotions 返回上游声明的情绪枚举（供能力接口/文档使用）。
+func Emotions() []string {
+	return []string{"happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"}
+}
+
+// ---------- transcriptions 参数面 ----------
 
 const (
 	TranscribeJSON        = "json"
 	TranscribeText        = "text"
 	TranscribeVerboseJSON = "verbose_json"
-	TranscribeSRT         = "srt"
-	TranscribeVTT         = "vtt"
-	// TranscribeDiarizedJSON 是 2026 版 OpenAI 的说话人分离格式。
-	// 上游没有 diarization，网关降级成 json + 空 segments（字段在，能力不在）。
+	// 以下格式是 OpenAI 合法的取值，但本部署没有真实数据可渲染。
+	TranscribeSRT          = "srt"
+	TranscribeVTT          = "vtt"
 	TranscribeDiarizedJSON = "diarized_json"
 )
 
@@ -151,12 +155,12 @@ var openAITranscribeFormats = map[string]bool{
 	TranscribeSRT: true, TranscribeVTT: true, TranscribeDiarizedJSON: true,
 }
 
-// NormalizeTranscriptionFormat 归一化 response_format，空值按 OpenAI 默认 json。
+// NormalizeTranscriptionFormat 归一化 response_format。
 //
-// ok=false 表示不是 OpenAI 的合法取值（400 invalid_request）。
-// srt / vtt 属于合法取值但上游做不到 —— 用 NeedsTimestamps 判定后单独报错，
-// 与"写了乱值"区分开，错误信息才能说到点上。
-func NormalizeTranscriptionFormat(s string) (format string, ok bool) {
+// known=false 表示不是 OpenAI 的合法取值（400 参数错误）。
+// known=true 但 SupportedTranscriptionFormat=false 表示取值合法、本部署不支持
+// （400 并说明原因：srt/vtt 需要真实分段，diarized_json 需要说话人分离）。
+func NormalizeTranscriptionFormat(s string) (format string, known bool) {
 	f := strings.ToLower(strings.TrimSpace(s))
 	if f == "" {
 		return TranscribeJSON, true
@@ -164,7 +168,7 @@ func NormalizeTranscriptionFormat(s string) (format string, ok bool) {
 	return f, openAITranscribeFormats[f]
 }
 
-// NeedsTimestamps 判定该格式是否要求逐句时间戳（上游 listen_audio 不提供）。
-func NeedsTimestamps(format string) bool {
-	return format == TranscribeSRT || format == TranscribeVTT
+// SupportedTranscriptionFormat 本部署实际能渲染的三种。
+func SupportedTranscriptionFormat(format string) bool {
+	return format == TranscribeJSON || format == TranscribeText || format == TranscribeVerboseJSON
 }

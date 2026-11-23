@@ -13,6 +13,7 @@ func TestResolveVoice(t *testing.T) {
 		{"ONYX", "male-qn-badao", true},
 		{"  shimmer  ", "female-tianmei", true},
 		{"ballad", "male-qn-badao-jingpin", true},
+		{"cedar", "male-qn-jingying-jingpin", true},
 		// 上游音色原样透传，且大小写保持（voice_id 大小写敏感）。
 		{"female-yujie", "female-yujie", false},
 		{"English_Graceful_Lady", "English_Graceful_Lady", false},
@@ -35,6 +36,9 @@ func TestOpenAIVoicesIntegrity(t *testing.T) {
 		"male-qn-badao": true, "male-qn-daxuesheng": true,
 		"female-shaonv": true, "female-yujie": true,
 		"female-chengshu": true, "female-tianmei": true,
+	}
+	if n := len(OpenAIVoices()); n != 13 {
+		t.Fatalf("OpenAI 别名数 = %d，期望 13", n)
 	}
 	for alias, id := range OpenAIVoices() {
 		if alias != lower(alias) {
@@ -60,80 +64,99 @@ func lower(s string) string {
 	return string(b)
 }
 
-func TestNormalizeSpeechFormat(t *testing.T) {
+func TestSupportedSpeechFormat(t *testing.T) {
 	cases := []struct {
-		in     string
-		format string
-		native bool
-		ok     bool
+		in  string
+		out string
+		ok  bool
 	}{
-		{"", "mp3", true, true},
-		{"mp3", "mp3", true, true},
-		{"MP3", "mp3", true, true},
-		{" wav ", "wav", false, true},
-		{"pcm", "pcm", false, true},
-		{"opus", "opus", false, true},
-		{"aac", "aac", false, true},
-		{"flac", "flac", false, true},
-		{"ogg", "ogg", false, false},
-		{"mp4", "mp4", false, false},
+		{"", "mp3", true},
+		{"mp3", "mp3", true},
+		{"MP3", "mp3", true},
+		// OpenAI 合法但本部署未声明：必须 400，不能降级成 mp3。
+		{"wav", "wav", false},
+		{"pcm", "pcm", false},
+		{"opus", "opus", false},
+		{"aac", "aac", false},
+		{"flac", "flac", false},
+		{"ogg", "ogg", false},
 	}
 	for _, c := range cases {
-		format, native, ok := NormalizeSpeechFormat(c.in)
-		if format != c.format || native != c.native || ok != c.ok {
-			t.Fatalf("NormalizeSpeechFormat(%q) = %q,%v,%v，期望 %q,%v,%v",
-				c.in, format, native, ok, c.format, c.native, c.ok)
+		out, ok := SupportedSpeechFormat(c.in)
+		if out != c.out || ok != c.ok {
+			t.Fatalf("SupportedSpeechFormat(%q) = %q,%v，期望 %q,%v", c.in, out, ok, c.out, c.ok)
 		}
 	}
 }
 
-func TestClampSpeed(t *testing.T) {
+func TestValidateSpeed(t *testing.T) {
 	cases := []struct {
-		in      float64
-		speed   float64
-		clamped bool
-		ok      bool
+		in float64
+		v  float64
+		ok bool
 	}{
-		{0, 0, false, true},
-		{1, 1, false, true},
-		{0.5, 0.5, false, true},
-		{2, 2, false, true},
-		{0.25, 0.5, true, true},
-		{0.3, 0.5, true, true},
-		{3, 2, true, true},
-		{4, 2, true, true},
-		{0.1, 0, false, false},
-		{4.1, 0, false, false},
-		{-1, 0, false, false},
+		{0, 0, true},
+		{1, 1, true},
+		{0.5, 0.5, true},
+		{2, 2, true},
+		// 超出声明区间：不接受、不钳位。
+		{0.25, 0, false},
+		{0.4, 0, false},
+		{2.1, 0, false},
+		{3, 0, false},
+		{4, 0, false},
+		{-1, 0, false},
 	}
 	for _, c := range cases {
-		speed, clamped, ok := ClampSpeed(c.in)
-		if speed != c.speed || clamped != c.clamped || ok != c.ok {
-			t.Fatalf("ClampSpeed(%v) = %v,%v,%v，期望 %v,%v,%v",
-				c.in, speed, clamped, ok, c.speed, c.clamped, c.ok)
+		v, ok := ValidateSpeed(c.in)
+		if v != c.v || ok != c.ok {
+			t.Fatalf("ValidateSpeed(%v) = %v,%v，期望 %v,%v", c.in, v, ok, c.v, c.ok)
 		}
 	}
 }
 
-func TestNormalizeTranscriptionFormat(t *testing.T) {
-	cases := map[string]string{
-		"":             TranscribeJSON,
-		"json":         TranscribeJSON,
-		"TEXT":         TranscribeText,
-		"verbose_json": TranscribeVerboseJSON,
-		"srt":          TranscribeSRT,
-		"vtt":          TranscribeVTT,
+func TestValidateExtensions(t *testing.T) {
+	if !ValidateVolume(0) || !ValidateVolume(10) || ValidateVolume(-0.1) || ValidateVolume(10.1) {
+		t.Fatal("volume 边界校验错误")
 	}
-	for in, want := range cases {
-		got, ok := NormalizeTranscriptionFormat(in)
-		if !ok || got != want {
-			t.Fatalf("NormalizeTranscriptionFormat(%q) = %q,%v，期望 %q,true", in, got, ok, want)
+	if !ValidatePitch(-12) || !ValidatePitch(12) || ValidatePitch(-13) || ValidatePitch(13) {
+		t.Fatal("pitch 边界校验错误")
+	}
+	for _, s := range []string{"", "happy", "SAD", "neutral"} {
+		if !ValidateEmotion(s) {
+			t.Fatalf("emotion %q 应合法", s)
 		}
 	}
-	if _, ok := NormalizeTranscriptionFormat("yaml"); ok {
-		t.Fatal("yaml 不是合法取值，应返回 ok=false")
+	for _, s := range []string{"excited", "calm"} {
+		if ValidateEmotion(s) {
+			t.Fatalf("emotion %q 应拒绝", s)
+		}
 	}
-	if !NeedsTimestamps(TranscribeSRT) || !NeedsTimestamps(TranscribeVTT) || NeedsTimestamps(TranscribeJSON) {
-		t.Fatal("NeedsTimestamps 判定错误")
+}
+
+func TestTranscriptionFormats(t *testing.T) {
+	known := map[string]bool{
+		"":              true,
+		"json":          true,
+		"TEXT":          true,
+		"verbose_json":  true,
+		"srt":           true,
+		"vtt":           true,
+		"diarized_json": true,
+		"yaml":          false,
+	}
+	for in, wantKnown := range known {
+		format, ok := NormalizeTranscriptionFormat(in)
+		if ok != wantKnown {
+			t.Fatalf("NormalizeTranscriptionFormat(%q) known = %v，期望 %v", in, ok, wantKnown)
+		}
+		if wantKnown && !SupportedTranscriptionFormat(format) {
+			switch format {
+			case TranscribeSRT, TranscribeVTT, TranscribeDiarizedJSON:
+				// 合法但本部署不支持，符合预期。
+			default:
+				t.Fatalf("%q 应被声明为支持", format)
+			}
+		}
 	}
 }

@@ -33,6 +33,18 @@ func (s *Server) mediaClient() *media.Client {
 	return media.New(time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second)
 }
 
+// nonIdempotentTool 判断工具是否可能"已经生成并计费"。
+//
+// 语音合成、语音转写、音乐生成都属于这一类：请求发出后上游可能已经产出结果，
+// 只是响应在网络上丢失/超时。此时换号重试等于再扣一次费，必须直接返回错误。
+func nonIdempotentTool(tool string) bool {
+	switch tool {
+	case media.ToolSpeech, media.ToolTranscribe, media.ToolMusic:
+		return true
+	}
+	return false
+}
+
 // callMedia 选号 → 取新鲜 token → 打媒体网关，按上游语义决定要不要换号。
 //
 // 与文本链路的差别：媒体接口用 body 里的 code 表达业务错误，且 402（计费）
@@ -73,7 +85,23 @@ func (s *Server) callMedia(ctx context.Context, tool string, payload any) ([]byt
 		lastRaw, lastErr = raw, cerr
 
 		var me *media.Error
-		if errors.As(cerr, &me) {
+		isMediaErr := errors.As(cerr, &me)
+		// 非幂等工具（合成/转写/音乐）的"未知结果"绝不换号重试：
+		// 网络错误、5xx、超时都可能已经在上游生成并计费，重试会重复扣费
+		// （audio-adapter 规范的「非幂等请求不自动重试」）。
+		// 认证失败、429、400、402、451 属于"确定没生成"，换号是安全的。
+		if nonIdempotentTool(tool) {
+			if !isMediaErr {
+				return raw, cerr
+			}
+			safeToRetry := me.IsAuth() || me.IsBilling() || me.IsRequest() ||
+				me.IsPoll() || me.IsContent() ||
+				me.HTTPStatus == http.StatusTooManyRequests || me.Code == http.StatusTooManyRequests
+			if !safeToRetry {
+				return raw, cerr
+			}
+		}
+		if isMediaErr {
 			// 计费 / 参数 / "稍后再查"：换号无用，重试还可能打乱已计费任务。
 			// 但 raw 要带回去 —— 视频轮询的 503 里带着 status，客户端据它继续轮询。
 			if me.IsContent() {
