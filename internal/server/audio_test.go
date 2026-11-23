@@ -119,7 +119,7 @@ func TestSpeechUpstreamBilling(t *testing.T) {
 	var got map[string]any
 	f := newFixture(t, fakeAudioServer(t, &mu, &got, true), "tok1")
 
-	resp, raw := f.post(t, "/v1/audio/speech", `{"input":"hi"}`)
+	resp, raw := f.post(t, "/v1/audio/speech", `{"model":"tts-1","voice":"nova","input":"hi"}`)
 	if resp.StatusCode != http.StatusPaymentRequired {
 		t.Fatalf("状态码 = %d，期望 402，body=%s", resp.StatusCode, raw)
 	}
@@ -139,9 +139,9 @@ func TestSpeechRejectsInvalidParams(t *testing.T) {
 		param string
 	}{
 		{"空 input", `{"input":"  "}`, "input"},
-		{"非法 response_format", `{"input":"hi","response_format":"ogg"}`, "response_format"},
-		{"speed 越界", `{"input":"hi","speed":5}`, "speed"},
-		{"非法 stream_format", `{"input":"hi","stream_format":"multipart"}`, "stream_format"},
+		{"非法 response_format", `{"model":"tts-1","voice":"nova","input":"hi","response_format":"ogg"}`, "response_format"},
+		{"speed 越界", `{"model":"tts-1","voice":"nova","input":"hi","speed":5}`, "speed"},
+		{"非法 stream_format", `{"model":"tts-1","voice":"nova","input":"hi","stream_format":"multipart"}`, "stream_format"},
 	}
 	for _, c := range cases {
 		resp, raw := f.post(t, "/v1/audio/speech", c.body)
@@ -260,6 +260,7 @@ func TestTranscriptionsVerboseJSON(t *testing.T) {
 	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
 
 	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":           "whisper-1",
 		"response_format": "verbose_json",
 		"language":        "ZH",
 	})
@@ -291,6 +292,7 @@ func TestTranscriptionsSRTRejectsUnparsableContainer(t *testing.T) {
 	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
 
 	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":           "whisper-1",
 		"response_format": "srt",
 	})
 	if resp.StatusCode != http.StatusBadRequest {
@@ -337,6 +339,7 @@ func TestTranscriptionsSRT(t *testing.T) {
 	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
 
 	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", validWAV(), map[string]string{
+		"model":           "whisper-1",
 		"response_format": "srt",
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -357,6 +360,7 @@ func TestTranscriptionsDiarizedJSONDegrades(t *testing.T) {
 	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
 
 	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":           "whisper-1",
 		"response_format": "diarized_json",
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -506,6 +510,7 @@ func TestTranscriptionsStreamIgnoresSubtitleFormat(t *testing.T) {
 
 	// stream=true 只产出文本事件，不该因为容器解析不出时长而 400。
 	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":           "whisper-1",
 		"response_format": "srt",
 		"stream":          "true",
 	})
@@ -553,5 +558,147 @@ func TestTranscriptionsJSONRejectsMissingFile(t *testing.T) {
 	}
 	if !bytes.Contains(raw, []byte("missing_audio")) {
 		t.Fatalf("错误码应为 missing_audio，body=%s", raw)
+	}
+}
+
+func TestSpeechRequiredFields(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeAudioServer(t, &mu, &got, false), "tok1")
+
+	cases := []struct{ name, body, param string }{
+		{"缺 model", `{"voice":"nova","input":"hi"}`, "model"},
+		{"缺 voice", `{"model":"tts-1","input":"hi"}`, "voice"},
+		{"空 voice 对象", `{"model":"tts-1","voice":{"id":""},"input":"hi"}`, "voice"},
+	}
+	for _, c := range cases {
+		resp, raw := f.post(t, "/v1/audio/speech", c.body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: 状态码 = %d，期望 400，body=%s", c.name, resp.StatusCode, raw)
+		}
+		var out struct {
+			Error struct {
+				Param string `json:"param"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &out)
+		if out.Error.Param != c.param {
+			t.Fatalf("%s: param = %q，期望 %q", c.name, out.Error.Param, c.param)
+		}
+	}
+	if f.upCalls() != 0 {
+		t.Fatalf("必填校验失败不该打上游，实际 %d 次", f.upCalls())
+	}
+}
+
+func TestSpeechInputTooLong(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeAudioServer(t, &mu, &got, false), "tok1")
+
+	body := fmt.Sprintf(`{"model":"tts-1","voice":"nova","input":%q}`,
+		strings.Repeat("好", maxSpeechInput+1))
+	resp, raw := f.post(t, "/v1/audio/speech", body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	}
+	if !bytes.Contains(raw, []byte(`"param":"input"`)) {
+		t.Fatalf("应指向 param=input，body=%s", raw)
+	}
+	if f.upCalls() != 0 {
+		t.Fatalf("超长 input 不该打上游，实际 %d 次", f.upCalls())
+	}
+}
+
+func TestSpeechSignalsIgnoredInstructions(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeAudioServer(t, &mu, &got, false), "tok1")
+
+	resp, raw := f.post(t, "/v1/audio/speech",
+		`{"model":"tts-1","voice":"nova","input":"hi","instructions":"温柔一点"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	if v := resp.Header.Get("X-MiniMax-Not-Forwarded"); !strings.Contains(v, "instructions") {
+		t.Fatalf("X-MiniMax-Not-Forwarded = %q，应点名 instructions", v)
+	}
+}
+
+func TestTranscriptionsDuplicateFileRejected(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for i := 0; i < 2; i++ {
+		fw, err := mw.CreateFormFile("file", fmt.Sprintf("a%d.wav", i))
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		_, _ = fw.Write(wavHeader())
+	}
+	_ = mw.WriteField("model", "whisper-1")
+	_ = mw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, f.front.URL+"/v1/audio/transcriptions", &buf)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400，body=%s", resp.StatusCode, raw)
+	}
+	if !bytes.Contains(raw, []byte("duplicate_file")) {
+		t.Fatalf("错误码应为 duplicate_file，body=%s", raw)
+	}
+	if f.upCalls() != 0 {
+		t.Fatalf("重复 file 不该打上游，实际 %d 次", f.upCalls())
+	}
+}
+
+func TestTranscriptionsSignalsNotForwardedFields(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	f := newFixture(t, fakeTranscribeServer(t, &mu, &got), "tok1")
+
+	resp, raw := multipartAudio(t, f.front.URL+"/v1/audio/transcriptions", wavHeader(), map[string]string{
+		"model":                     "whisper-1",
+		"language":                  "zh",
+		"temperature":               "0.2",
+		"timestamp_granularities[]": "word",
+		"include[]":                 "logprobs",
+		"chunking_strategy":         "auto",
+		"keywords[]":                "MiniMax",
+		"unknown_vendor_field":      "x",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，body=%s", resp.StatusCode, raw)
+	}
+	hdr := resp.Header.Get("X-MiniMax-Not-Forwarded")
+	for _, want := range []string{"language", "temperature", "timestamp_granularities", "include", "chunking_strategy", "keywords"} {
+		if !strings.Contains(hdr, want) {
+			t.Fatalf("X-MiniMax-Not-Forwarded = %q，缺少 %s", hdr, want)
+		}
+	}
+}
+
+// 上游凭据失效必须是 502：回 401 会让客户端以为自己的 key 错了。
+func TestMediaUpstreamAuthMapsTo502(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"code":401,"message":"invalid token"}`)
+	}, "tok1")
+
+	resp, raw := f.post(t, "/v1/audio/speech", `{"model":"tts-1","voice":"nova","input":"hi"}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d，期望 502，body=%s", resp.StatusCode, raw)
+	}
+	if !bytes.Contains(raw, []byte("upstream_auth")) {
+		t.Fatalf("错误码应为 upstream_auth，body=%s", raw)
 	}
 }

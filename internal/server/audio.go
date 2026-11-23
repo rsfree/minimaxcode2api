@@ -20,6 +20,13 @@ import (
 // 上游只收 URL / 内联 base64，超限的请求在网关侧就拦掉，不白占一次槽位。
 const maxAudioUpload = 25 << 20
 
+// maxSpeechBody 是 /v1/audio/speech 的 JSON 上限。OpenAI 侧 input 上限 4096 字符，
+// 1MB 足够宽松；不设上限会让超大 body 先进内存再被拒（skill 的陷阱 #9）。
+const maxSpeechBody = 1 << 20
+
+// maxSpeechInput 是 OpenAI 的 input 字符上限（上游 TTS 可到 10000，北向仍按 4096）。
+const maxSpeechInput = 4096
+
 // speechSSEChunk 是 SSE 音频分片大小。16KiB 原始字节 → 约 21.8KiB base64，
 // 对长文本既不会产生上千个事件，也不会让单个事件过大。
 const speechSSEChunk = 16 << 10
@@ -99,7 +106,14 @@ type speechResponse struct {
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var req speechRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxSpeechBody)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "", "request_too_large",
+				fmt.Sprintf("请求体超过 %d KB（OpenAI 上限）", maxSpeechBody>>10))
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
@@ -107,6 +121,26 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	if text == "" {
 		writeFourKeyError(w, http.StatusBadRequest, "", "input", "invalid_request", "input 不能为空")
 		return
+	}
+	if n := len([]rune(text)); n > maxSpeechInput {
+		writeFourKeyError(w, http.StatusBadRequest, "", "input", "invalid_request",
+			fmt.Sprintf("input 最多 %d 字符（OpenAI 上限），收到 %d", maxSpeechInput, n))
+		return
+	}
+	if strings.TrimSpace(req.Model) == "" {
+		writeFourKeyError(w, http.StatusBadRequest, "", "model", "invalid_request", "model 不能为空")
+		return
+	}
+	if strings.TrimSpace(req.Voice.ID) == "" {
+		writeFourKeyError(w, http.StatusBadRequest, "", "voice", "invalid_request",
+			`voice 不能为空：字符串或 {"id":"..."} 都接受`)
+		return
+	}
+	// 接收 ≠ 支持：上游没有 instructions 的等价参数，不能静默吞掉，
+	// 在响应头里点名（skill 的「接收≠支持」纪律；不 400 是为了兼容客户端）。
+	var notForwarded []string
+	if strings.TrimSpace(req.Instructions) != "" {
+		notForwarded = append(notForwarded, "instructions")
 	}
 	streamFormat := strings.ToLower(strings.TrimSpace(req.StreamFormat))
 	useSSE := streamFormat == "sse"
@@ -187,6 +221,9 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("X-MiniMax-Format", actual)
+	if len(notForwarded) > 0 {
+		h.Set("X-MiniMax-Not-Forwarded", strings.Join(notForwarded, ","))
+	}
 	if !native {
 		// 显式降级：客户端要 wav/pcm/…，上游只出 mp3。请求本身合法，不报错，
 		// 但必须让调用方在响应头里看到这件事，别以为拿到了想要的格式。
@@ -232,7 +269,7 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 
 	h.Set("Content-Type", mime)
 	h.Set("Content-Length", strconv.Itoa(len(body)))
-	h.Set("Content-Disposition", `inline; filename="speech.`+actual+`"`)
+	h.Set("Content-Disposition", `inline; filename="speech.`+safeExtension(actual)+`"`)
 	s.logMedia(r, req.Model, http.StatusOK, start, nil)
 	_, _ = w.Write(body)
 }
@@ -286,11 +323,18 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(maxAudioUpload); err != nil {
 			var mbe *http.MaxBytesError
 			if errors.As(err, &mbe) {
-				writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "file", "file_too_large",
+				writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "file", "request_too_large",
 					fmt.Sprintf("音频超过 %d MB（OpenAI 上限）", maxAudioUpload>>20))
 				return
 			}
 			writeFourKeyError(w, http.StatusBadRequest, "", "file", "invalid_form", err.Error())
+			return
+		}
+		// r.FormFile 只取第一个 file；多传的会被静默丢掉（skill 的陷阱 #6），
+		// 对转写这种「传错文件就全错」的接口必须显式拒绝。
+		if r.MultipartForm != nil && len(r.MultipartForm.File["file"]) > 1 {
+			writeFourKeyError(w, http.StatusBadRequest, "", "file", "duplicate_file",
+				fmt.Sprintf("一次只能上传一个 file，收到 %d 个", len(r.MultipartForm.File["file"])))
 			return
 		}
 		file, hdr, err := r.FormFile("file")
@@ -310,7 +354,7 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(data) > maxAudioUpload {
-			writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "file", "file_too_large",
+			writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "file", "request_too_large",
 				fmt.Sprintf("音频超过 %d MB（OpenAI 上限）", maxAudioUpload>>20))
 			return
 		}
@@ -322,6 +366,15 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		meta.Prompt = r.FormValue("prompt")
 		meta.ResponseFormat = r.FormValue("response_format")
 		meta.Stream = parseFlexBool(r.FormValue("stream"))
+		if v := strings.TrimSpace(r.FormValue("temperature")); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				meta.Temperature = &f
+			}
+		}
+		if v := strings.TrimSpace(r.FormValue("chunking_strategy")); v != "" {
+			// multipart 里只有字符串形态；原样记下来，仅用于「未下发」标注。
+			meta.ChunkingStrategy = json.RawMessage(strconv.Quote(v))
+		}
 		meta.TimestampGranularities = formList(r, "timestamp_granularities[]", "timestamp_granularities")
 		meta.Include = formList(r, "include[]", "include")
 		meta.Languages = formList(r, "languages[]", "languages")
@@ -341,7 +394,7 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			var mbe *http.MaxBytesError
 			if errors.As(err, &mbe) {
-				writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "data", "file_too_large",
+				writeFourKeyError(w, http.StatusRequestEntityTooLarge, "", "data", "request_too_large",
 					fmt.Sprintf("音频超过 %d MB（OpenAI 上限）", maxAudioUpload>>20))
 				return
 			}
@@ -364,6 +417,12 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		meta = body.transcriptionRequest
 	}
 
+	// 必填字段先校验：OpenAI 的 model 是必填（旧版这里默认 whisper-1，
+	// 会把「客户端漏传」伪装成成功，skill 的契约要求显式拒绝）。
+	if strings.TrimSpace(meta.Model) == "" {
+		writeFourKeyError(w, http.StatusBadRequest, "", "model", "invalid_request", "model 不能为空")
+		return
+	}
 	format, ok := audioproto.NormalizeTranscriptionFormat(meta.ResponseFormat)
 	if !ok {
 		writeFourKeyError(w, http.StatusBadRequest, "", "response_format", "invalid_request",
@@ -391,7 +450,37 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	if p := strings.TrimSpace(meta.Prompt); p != "" {
 		info["prompt"] = p
 	}
-	model := firstNonEmptyStr(strings.TrimSpace(meta.Model), "whisper-1")
+	// 接收 ≠ 支持：这些字段北向收下，但上游 listen_audio 没有对应参数。
+	// 在响应头里逐项点名，避免客户端以为「传了就生效」。
+	var notForwarded []string
+	if strings.TrimSpace(meta.Language) != "" {
+		notForwarded = append(notForwarded, "language")
+	}
+	if len(meta.Languages) > 0 {
+		notForwarded = append(notForwarded, "languages")
+	}
+	if meta.Temperature != nil {
+		notForwarded = append(notForwarded, "temperature")
+	}
+	if len(meta.TimestampGranularities) > 0 {
+		notForwarded = append(notForwarded, "timestamp_granularities")
+	}
+	if len(meta.Include) > 0 {
+		notForwarded = append(notForwarded, "include")
+	}
+	if len(bytes.TrimSpace(meta.ChunkingStrategy)) > 0 && string(bytes.TrimSpace(meta.ChunkingStrategy)) != "null" {
+		notForwarded = append(notForwarded, "chunking_strategy")
+	}
+	if len(meta.Keywords) > 0 {
+		notForwarded = append(notForwarded, "keywords")
+	}
+	if len(meta.KnownSpeakerNames) > 0 {
+		notForwarded = append(notForwarded, "known_speaker_names")
+	}
+	if len(meta.KnownSpeakerReferences) > 0 {
+		notForwarded = append(notForwarded, "known_speaker_references")
+	}
+	model := strings.TrimSpace(meta.Model)
 
 	raw, err := s.callMedia(r.Context(), media.ToolTranscribe, map[string]any{"audio_info": info})
 	if err != nil {
@@ -417,6 +506,9 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logMedia(r, model, http.StatusOK, start, nil)
+	if len(notForwarded) > 0 {
+		w.Header().Set("X-MiniMax-Not-Forwarded", strings.Join(notForwarded, ","))
+	}
 
 	// stream 优先于 response_format：OpenAI 的流式转写只产出文本增量事件。
 	if meta.Stream {
@@ -479,6 +571,22 @@ func (s *Server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"text": text})
 	}
+}
+
+// safeExtension 只允许 [A-Za-z0-9]{1,10}，否则回 bin。
+// Content-Disposition 的 filename 不能拿上游 mime 的后缀直接拼（skill 的陷阱 #7）。
+func safeExtension(s string) string {
+	if len(s) == 0 || len(s) > 10 {
+		return "bin"
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			continue
+		}
+		return "bin"
+	}
+	return s
 }
 
 // writeSSE 写一个 OpenAI 形态的事件。data 里的 type 由调用方给，

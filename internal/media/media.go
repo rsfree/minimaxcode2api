@@ -184,7 +184,10 @@ func StatusOf(err error) int {
 		case me.IsBilling():
 			return http.StatusPaymentRequired
 		case me.IsAuth():
-			return http.StatusUnauthorized
+			// 上游凭据失效是**网关自己的**故障：回 401 会让客户端以为自己
+			// 的 key 错了（重配/换 key 都无救），必须报 502 + upstream_auth。
+			// 文本链路（server.upstreamStatus）早就是这个口径，这里对齐。
+			return http.StatusBadGateway
 		case me.IsRequest():
 			return http.StatusBadRequest
 		case me.HTTPStatus == http.StatusTooManyRequests:

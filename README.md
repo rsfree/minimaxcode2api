@@ -686,7 +686,11 @@ pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
 | `response_format`（ASR） | `json` / `text` / `verbose_json` 原生；`srt` / `vtt` 生成**单条字幕**（时间轴 0 → 音频真实时长，mp3/wav/m4a 可解析）；`diarized_json` 降级为 json + 空 `segments` |
 | `stream`（ASR） | 支持：回 `transcript.text.delta` / `transcript.text.done`。上游一次给全文，所以只有一个 delta |
 | `temperature` / `timestamp_granularities` / `include` / `chunking_strategy` / `keywords` / `known_speaker_*` | 全部接收；上游没有对应能力，忽略并在 `verbose_json` 的 `warnings` 里注明 |
-| `file` 大小 | 25MB 上限（对齐 OpenAI），超限 413 |
+| `model` / `voice`（speech） | 必填非空（对齐 OpenAI）；`voice` 空对象也 400 |
+| `input` | 1–4096 字符（上游可到 10000，北向按 OpenAI 收紧） |
+| `model`（ASR） | 必填，不再默认 `whisper-1` |
+| `file` | 必填且**只能一个**，重复 `file` 直接 400；单文件 25MB |
+| JSON body | `/v1/audio/speech` 上限 1MB（`Content-Length` 预检），超限 413 |
 
 **音色映射**（近似映射：对齐性别与语调，不承诺听感与 OpenAI 一致）：
 
@@ -712,6 +716,7 @@ pitch / emotion`，**没有 `format`**；ASR 工具 `listen_audio` 只有
 | `X-MiniMax-Voice` / `X-MiniMax-Voice-Alias` | 实际下发的 `voice_id` / 命中的 OpenAI 别名 |
 | `X-MiniMax-Speed` | 仅当 speed 被收敛时出现，值为实际下发值 |
 | `X-MiniMax-Response-Format` | ASR 的降级结果（如 `diarized_json → json`） |
+| `X-MiniMax-Not-Forwarded` | 北向收下、但上游没有对应能力的字段名清单（逗号分隔） |
 
 `verbose_json` 的 `segments` 恒为空数组，并带 `warnings` 说明上游不返回时间戳；
 srt/vtt 的时间轴来自网关侧解析的音频时长，不是上游返回。
@@ -729,6 +734,24 @@ Python SDK（2.x）+ 本地假上游验证（不消耗额度，也不依赖上�
 | `transcriptions.create(..., response_format="srt")` | 返回 `str`，单条 cue（`00:00:00,000 --> 00:00:02,592`） |
 | `transcriptions.create(..., response_format="diarized_json")` | 返回 `TranscriptionDiarized`，`segments=[]` |
 | `temperature` / `timestamp_granularities` / `include` / `chunking_strategy` / `languages` / `keywords` / `known_speaker_names` | 全部接收，`verbose_json` 里带对应 `warnings` |
+
+### 与 `audio-adapter` skill 的口径差异
+
+skill 的纪律是「北向只做 OpenAI 契约；接收 ≠ 支持，引擎必须显式映射或 400」。
+已对齐：`model`/`voice` 必填、`input ≤ 4096`、JSON body 1MB 预检、重复 `file` 400、
+`Content-Disposition` 后缀白名单、上游 401/403 → **502**、忽略字段用
+`X-MiniMax-Not-Forwarded` 点名。
+
+有意不 400 的三处（按「字段对上即可、枚举不必完全匹配」的口径）：
+
+| 场景 | skill | 本网关 | 原因 |
+|---|---|---|---|
+| `instructions` | 400 | 忽略 + 响应头点名 | OpenAI 客户端经常默认携带，400 会直接打断主流 TTS 客户端 |
+| 上游没有的 ASR 字段 | 400 | 忽略 + 响应头 + verbose_json warnings | 同上，先保证可用性，同时让「没生效」可观测 |
+| `speed` 超出上游 0.5–2.0 | 400 | 收敛 + `X-MiniMax-Speed` | 保音频可用，调整值可查 |
+
+另有一处**语义差异**：skill 要求没有真实分段时 `srt`/`vtt` 直接 400；本网关按需求
+生成单条字幕（时间轴 0 → 音频真实时长），不使用全零时间轴，也不伪造多段。
 
 ## 扩展能力（同步视频 / 图像工具 / 理解类）
 
